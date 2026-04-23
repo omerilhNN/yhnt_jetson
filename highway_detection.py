@@ -2,7 +2,13 @@
 """
 Highway Vehicle Detection — Jetson Orin Nano + DeepStream + YOLO26
 
-Pipeline: B0495C USB kamera -> nvinfer (YOLO26 TensorRT) -> nvdsosd -> ekran
+Pipeline:
+    B0495C USB kamera
+        -> nvinfer (YOLO26 TensorRT)
+        -> nvdsosd
+        -> tee
+            ├─ (opsiyonel) yerel ekran
+            └─ (opsiyonel) RTSP yayını -> rtsp://jetson:8554/stream
 
 Çalıştırma yeri: /home/dev/Desktop/yhnt/yhnt_jetson/
 Repo yapısı:
@@ -12,10 +18,14 @@ Repo yapısı:
     lib/                      <- libnvdsinfer_custom_impl_Yolo.so
 
 Kullanım:
-    python3 highway_detection.py                    # default: yolo26s
-    python3 highway_detection.py --model n          # yolo26n
-    python3 highway_detection.py --debug            # her frame'in tespitlerini bas
-    python3 highway_detection.py --model n --debug
+    python3 highway_detection.py                   # ekran + RTSP (default)
+    python3 highway_detection.py --model n         # yolo26n
+    python3 highway_detection.py --debug           # her frame detayı
+    python3 highway_detection.py --no-display      # monitörsüz, sadece RTSP
+    python3 highway_detection.py --no-rtsp         # sadece yerel ekran
+
+VLC ile RTSP izleme (aynı LAN'dan):
+    vlc rtsp://<JETSON_IP>:8554/stream
 
 Çıkış: Ctrl+C
 """
@@ -28,7 +38,8 @@ from collections import defaultdict
 
 import gi
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst, GLib
+gi.require_version("GstRtspServer", "1.0")
+from gi.repository import Gst, GLib, GstRtspServer
 
 import pyds
 
@@ -40,10 +51,17 @@ CAMERA_WIDTH = 1920
 CAMERA_HEIGHT = 1200
 CAMERA_FPS = 30
 
+RTSP_PORT = 8554
+RTSP_MOUNT = "/stream"
+RTSP_UDP_PORT = 5400   # Pipeline -> RTSP server arası dahili UDP portu
+
+# Encoder bitrate (bps). 4 Mbps 1080p highway için yeterli.
+ENCODER_BITRATE = 4_000_000
+
 # Senin eğittiğin sınıflar (models/labels.txt ile aynı sırada olmalı)
 CLASS_NAMES = ["others", "car", "van", "bus"]
 
-# Repo kökü (script'in bulunduğu klasör)
+# Repo kökü
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -66,14 +84,24 @@ def parse_args():
         "--device", default=CAMERA_DEVICE,
         help="V4L2 kamera aygıtı",
     )
+    parser.add_argument(
+        "--no-display", action="store_true",
+        help="Yerel monitöre çizme (saha modu)",
+    )
+    parser.add_argument(
+        "--no-rtsp", action="store_true",
+        help="RTSP yayını yapma",
+    )
+    parser.add_argument(
+        "--rtsp-port", type=int, default=RTSP_PORT,
+        help="RTSP sunucu portu",
+    )
     return parser.parse_args()
 
 
 # ─── İstatistik toplayıcı ─────────────────────────────────────────────────────
 
 class Stats:
-    """FPS ve tespit sayısı için basit sayaç. Her saniye özet basar."""
-
     def __init__(self):
         self.frame_count = 0
         self.total_detections = 0
@@ -113,11 +141,6 @@ class Stats:
 # ─── Pad probe: frame metadata okuma ──────────────────────────────────────────
 
 def make_osd_sink_pad_probe(stats, debug=False):
-    """
-    nvdsosd'nin sink pad'ine probe olarak bağlanan callback üretici.
-    Her frame için DeepStream metadata'sını okuyup istatistik ve debug çıktısı üretir.
-    """
-
     def probe(pad, info, u_data):
         gst_buffer = info.get_buffer()
         if not gst_buffer:
@@ -179,7 +202,20 @@ def make_osd_sink_pad_probe(stats, debug=False):
 # ─── Pipeline kurulum ─────────────────────────────────────────────────────────
 
 def build_pipeline(args):
-    """Pipeline'ı string'den kurar."""
+    """
+    Pipeline yapısı:
+
+    [v4l2src ... nvinfer ... nvdsosd] -> tee
+                                         ├─ queue -> nvvideoconvert -> videoconvert -> autovideosink
+                                         └─ queue -> nvvideoconvert -> nvv4l2h264enc -> rtph264pay -> udpsink
+
+    Display ve/veya RTSP branch'ları bayraklara göre dahil edilir.
+    En az biri aktif olmalı.
+    """
+
+    if args.no_display and args.no_rtsp:
+        print("HATA: --no-display ve --no-rtsp birlikte kullanılamaz (hiç çıkış kalmaz)")
+        sys.exit(1)
 
     config_file = os.path.join(
         REPO_ROOT, "configs", f"config_infer_primary_yolo26{args.model}.txt"
@@ -187,12 +223,10 @@ def build_pipeline(args):
 
     if not os.path.exists(config_file):
         print(f"HATA: Config dosyası bulunamadı: {config_file}")
-        print(f"Beklenen dosyalar:")
-        print(f"  {REPO_ROOT}/configs/config_infer_primary_yolo26s.txt")
-        print(f"  {REPO_ROOT}/configs/config_infer_primary_yolo26n.txt")
         sys.exit(1)
 
-    pipeline_str = f"""
+    # Common: kamera -> inference -> OSD -> tee
+    common = f"""
         v4l2src device={args.device} !
         video/x-raw,format=YUY2,width={CAMERA_WIDTH},height={CAMERA_HEIGHT},framerate={CAMERA_FPS}/1 !
         videoconvert !
@@ -205,14 +239,36 @@ def build_pipeline(args):
         nvinfer config-file-path={config_file} name=primary-inference !
         nvvideoconvert !
         nvdsosd name=osd !
+        tee name=t
+    """
+
+    # Yerel ekran branch
+    display_branch = """
+        t. ! queue !
         nvvideoconvert !
         video/x-raw,format=RGBA !
         videoconvert !
         autovideosink sync=false
-    """
+    """ if not args.no_display else ""
 
-    print(f"Pipeline kuruluyor (model: yolo26{args.model}, debug: {args.debug})")
-    print(f"Config: {config_file}")
+    # RTSP branch — HW H.264 encoder + UDP push to local RTSP server
+    rtsp_branch = f"""
+        t. ! queue !
+        nvvideoconvert !
+        video/x-raw,format=I420 !
+        x264enc bitrate=4000 tune=zerolatency speed-preset=ultrafast key-int-max=30 !
+        h264parse !
+        rtph264pay config-interval=1 pt=96 !
+        udpsink host=127.0.0.1 port={RTSP_UDP_PORT} sync=false async=false
+    """ if not args.no_rtsp else ""
+
+    pipeline_str = common + display_branch + rtsp_branch
+
+    print(f"Pipeline kuruluyor:")
+    print(f"  Model:    yolo26{args.model}")
+    print(f"  Display:  {'kapalı' if args.no_display else 'aktif'}")
+    print(f"  RTSP:     {'kapalı' if args.no_rtsp else f'rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT}'}")
+    print(f"  Debug:    {args.debug}")
 
     try:
         pipeline = Gst.parse_launch(pipeline_str)
@@ -221,6 +277,31 @@ def build_pipeline(args):
         sys.exit(1)
 
     return pipeline
+
+
+# ─── RTSP sunucu ──────────────────────────────────────────────────────────────
+
+def start_rtsp_server(port, mount_path, udp_port):
+    """
+    udpsink'in gönderdiği H.264 stream'i alıp RTSP olarak yayınlar.
+    İstemciler rtsp://<ip>:<port><mount_path> ile bağlanır.
+    """
+    server = GstRtspServer.RTSPServer()
+    server.props.service = str(port)
+
+    factory = GstRtspServer.RTSPMediaFactory()
+    factory.set_launch(
+        f"( udpsrc name=pay0 port={udp_port} buffer-size=524288 "
+        f'caps="application/x-rtp, media=video, clock-rate=90000, '
+        f'encoding-name=H264, payload=96" )'
+    )
+    factory.set_shared(True)
+
+    mounts = server.get_mount_points()
+    mounts.add_factory(mount_path, factory)
+
+    server.attach(None)
+    return server
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -268,6 +349,12 @@ def main():
     bus.add_signal_watch()
     bus.connect("message", on_message, loop)
 
+    rtsp_server = None
+    if not args.no_rtsp:
+        rtsp_server = start_rtsp_server(args.rtsp_port, RTSP_MOUNT, RTSP_UDP_PORT)
+        print(f"[bilgi] RTSP sunucu hazır: rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT}")
+        print(f"        (VLC ile izle: vlc rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT})")
+
     print("[bilgi] Engine yükleniyor (ilk açılışta 10-20 sn sürebilir)...")
     pipeline.set_state(Gst.State.PLAYING)
 
@@ -276,7 +363,6 @@ def main():
     except KeyboardInterrupt:
         print("\n[bilgi] Kullanıcı kesintisi, kapatılıyor...")
 
-    # Özet
     total_time = time.time() - stats.start_time
     if stats.frame_count > 0:
         print(f"\n─── Oturum özeti ───")
