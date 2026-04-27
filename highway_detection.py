@@ -294,7 +294,7 @@ def build_pipeline(args):
         video/x-raw,format=YUY2,width={CAMERA_WIDTH},height={CAMERA_HEIGHT},framerate={CAMERA_FPS}/1 !
         videoconvert !
         video/x-raw,format=NV12 !
-        nvvideoconvert !
+        nvvideoconvert copy-hw=2 !
         video/x-raw(memory:NVMM),format=NV12 !
         mux.sink_0 nvstreammux name=mux
                     batch-size=1
@@ -311,9 +311,9 @@ def build_pipeline(args):
                     tracker-width={TRACKER_WIDTH}
                     tracker-height={TRACKER_HEIGHT}
                     display-tracking-id=1 !
-        nvvideoconvert !
+        nvvideoconvert copy-hw=2 !
         nvdsosd name=osd !
-        nvvideoconvert !
+        nvvideoconvert copy-hw=2 !
         video/x-raw,format=RGBA !
         tee name=t
     """
