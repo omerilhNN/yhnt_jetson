@@ -282,9 +282,11 @@ def build_pipeline(args):
     )
     tracker_config = os.path.join(REPO_ROOT, "configs", "tracker_config.yml")
 
-    for path, label in [(config_file, "Inference config"),
-                        (tracker_config, "Tracker config"),
-                        (TRACKER_LIB, "Tracker library")]:
+    for path, label in [
+        (config_file, "Inference config"),
+        (tracker_config, "Tracker config"),
+        (TRACKER_LIB, "Tracker library"),
+    ]:
         if not os.path.exists(path):
             print(f"HATA: {label} bulunamadı: {path}")
             sys.exit(1)
@@ -328,21 +330,21 @@ def build_pipeline(args):
         t. ! queue leaky=downstream max-size-buffers=4 max-size-time=0 max-size-bytes=0 !
         videoconvert !
         video/x-raw,format=I420 !
-        x264enc bitrate={ENCODER_BITRATE_KBPS} tune=zerolatency speed-preset=ultrafast key-int-max=30 !
-        h264parse !
+        x264enc bitrate={ENCODER_BITRATE_KBPS} tune=zerolatency speed-preset=ultrafast key-int-max=30 byte-stream=true bframes=0 !
+        h264parse config-interval=-1 !
         rtph264pay config-interval=1 pt=96 !
         udpsink host=127.0.0.1 port={RTSP_UDP_PORT} sync=false async=false
     """ if not args.no_rtsp else ""
 
     pipeline_str = common + display_branch + rtsp_branch
 
-    print(f"Pipeline kuruluyor:")
+    print("Pipeline kuruluyor:")
     print(f"  Model:    yolo26{args.model}")
     print(f"  Tracker:  NvSORT ({tracker_config})")
     print(f"  Display:  {'kapalı' if args.no_display else 'aktif'}")
     print(f"  RTSP:     {'kapalı' if args.no_rtsp else f'rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT}'}")
     if args.no_mqtt:
-        print(f"  MQTT:     kapalı")
+        print("  MQTT:     kapalı")
     else:
         print(f"  MQTT:     {args.mqtt_host}:{args.mqtt_port}")
         print(f"  Topic:    highway/detections/{args.sensor_id}")
@@ -385,8 +387,6 @@ def main():
     args = parse_args()
     Gst.init(None)
 
-    # MQTT publisher'ı pipeline'dan ÖNCE başlat — pipeline başlatıldığında
-    # ilk frame'ler de publish edilebilsin
     mqtt_publisher = None
     if not args.no_mqtt:
         mqtt_publisher = MqttPublisher(
@@ -437,8 +437,12 @@ def main():
 
     rtsp_server = None
     if not args.no_rtsp:
-        rtsp_server = start_rtsp_server(args.rtsp_port, RTSP_MOUNT, RTSP_UDP_PORT)
-        print(f"[bilgi] RTSP sunucu hazır: rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT}")
+        try:
+            rtsp_server = start_rtsp_server(args.rtsp_port, RTSP_MOUNT, RTSP_UDP_PORT)
+            print(f"[bilgi] RTSP sunucu hazır: rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT}")
+        except Exception as e:
+            print(f"[HATA] RTSP başlatılamadı: {e}")
+            sys.exit(1)
 
     print("[bilgi] Engine yükleniyor (ilk açılışta 10-20 sn sürebilir)...")
     pipeline.set_state(Gst.State.PLAYING)
@@ -448,13 +452,11 @@ def main():
     except KeyboardInterrupt:
         print("\n[bilgi] Kullanıcı kesintisi, kapatılıyor...")
 
-    # Cleanup
     pipeline.set_state(Gst.State.NULL)
 
     if mqtt_publisher:
         mqtt_publisher.stop()
 
-    # Özet
     total_time = time.time() - stats.start_time
     if stats.frame_count > 0:
         print(f"\n─── Oturum özeti ───")
