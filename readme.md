@@ -1,1 +1,1 @@
-High speed object detection and classification
+High speed object detection and classification GRAD project
