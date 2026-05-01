@@ -1,39 +1,36 @@
 #!/usr/bin/env python3
 """
-Highway Vehicle Detection — Jetson Orin Nano + DeepStream + YOLO26 + MQTT
+Highway Vehicle Detection — Jetson Orin Nano + DeepStream + YOLO + MQTT
 
-Topic yapısı (güncel):
-- highway/sensors/<sensor_id>/status            (QoS1 retained + LWT)
-- highway/sensors/<sensor_id>/meta              (QoS1 retained)
-- highway/sensors/<sensor_id>/heartbeat         (QoS0 periyodik)
-- highway/telemetry/<sensor_id>/detections      (QoS0 yüksek frekans)
-- highway/telemetry/<sensor_id>/stats           (QoS0 ~1 Hz)
-- highway/events/<sensor_id>/vehicle/enter      (QoS1)
-- highway/events/<sensor_id>/vehicle/exit       (QoS1)
-- highway/commands/<sensor_id>/request          (RPi5 -> Jetson, subscribe)
-- highway/commands/<sensor_id>/response         (Jetson -> RPi5, QoS1)
-
-NOT:
-- detections topic'i özellikle "highway/telemetry/<sensor_id>/detections" olarak korunmuştur.
+MQTT topic yapısı:
+- highway/telemetry/<sensor_id>/detections   (active-only, QoS0)
+- highway/telemetry/<sensor_id>/stats        (QoS0)
+- highway/sensors/<sensor_id>/status         (QoS1 retained + LWT)
+- highway/sensors/<sensor_id>/meta           (QoS1 retained)
+- highway/sensors/<sensor_id>/heartbeat      (QoS0)
+- highway/events/<sensor_id>/vehicle/enter   (QoS1)
+- highway/events/<sensor_id>/vehicle/exit    (QoS1)
+- highway/commands/<sensor_id>/request       (subscribe)
+- highway/commands/<sensor_id>/response      (QoS1)
 """
 
 import argparse
 import os
 import sys
 import time
-from collections import defaultdict, Counter, deque
+from collections import Counter, defaultdict, deque
 
 import gi
 gi.require_version("Gst", "1.0")
 gi.require_version("GstRtspServer", "1.0")
-from gi.repository import Gst, GLib, GstRtspServer
+from gi.repository import GLib, Gst, GstRtspServer
 
 import pyds
-
 from mqtt_publisher import MqttPublisher
 
-
-# ─── Sabitler ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
 
 CAMERA_DEVICE = "/dev/video0"
 CAMERA_WIDTH = 1920
@@ -44,17 +41,14 @@ RTSP_PORT = 8554
 RTSP_MOUNT = "/stream"
 RTSP_UDP_PORT = 5400
 
-ENCODER_BITRATE_KBPS = 4000
+ENCODER_BITRATE_KBPS = 9000
 STREAMMUX_BUFFER_POOL_SIZE = 16
-
-# JP6.2 nvbuf bug workaround
-NVVIDEOCONVERT_COPY_HW = 2
+NVVIDEOCONVERT_COPY_HW = 2  # JP6.2 workaround
 
 TRACKER_LIB = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"
 TRACKER_WIDTH = 960
 TRACKER_HEIGHT = 544
 
-# ── Tailscale defaultları ────────────────────────────────────────────────────
 DEFAULT_MQTT_HOST = "100.84.29.29"
 DEFAULT_MQTT_PORT = 1883
 DEFAULT_SENSOR_ID = "jetson01"
@@ -74,6 +68,10 @@ TRACK_HISTORY_MAXLEN = 30
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Highway araç tespit pipeline'ı + MQTT telemetri",
@@ -85,17 +83,17 @@ def parse_args():
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--no-rtsp", action="store_true")
     parser.add_argument("--rtsp-port", type=int, default=RTSP_PORT)
-    parser.add_argument(
-        "--rtsp-bind",
-        default=DEFAULT_RTSP_BIND,
-        help="RTSP sunucusu hangi IP'ye bind olsun.",
-    )
+    parser.add_argument("--rtsp-bind", default=DEFAULT_RTSP_BIND)
     parser.add_argument("--no-mqtt", action="store_true")
     parser.add_argument("--mqtt-host", default=DEFAULT_MQTT_HOST)
     parser.add_argument("--mqtt-port", type=int, default=DEFAULT_MQTT_PORT)
     parser.add_argument("--sensor-id", default=DEFAULT_SENSOR_ID)
     return parser.parse_args()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stats / Track lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
 
 class Stats:
     def __init__(self, mqtt_publisher=None):
@@ -107,6 +105,7 @@ class Stats:
         self._current_fps = 0.0
         self.total_raw_detections = 0
 
+        # tid -> track data
         self.tracks = {}
 
         self._last_class_counts_unique = defaultdict(int)
@@ -143,13 +142,12 @@ class Stats:
                 if tr["state"] == "tentative" and tr["hits"] >= TRACK_CONFIRM_MIN_HITS:
                     tr["state"] = "confirmed"
                     if not tr["entered_emitted"]:
-                        enter_evt = {
+                        self._pending_enter_events.append({
                             "type": "enter",
                             "track_id": int(tid),
                             "frame": int(current_frame_num),
                             "class_id": int(tr["majority_class"]),
-                        }
-                        self._pending_enter_events.append(enter_evt)
+                        })
                         tr["entered_emitted"] = True
                 elif tr["state"] == "lost":
                     tr["state"] = "confirmed"
@@ -163,13 +161,12 @@ class Stats:
             if tr["misses"] >= TRACK_END_TTL_FRAMES:
                 tr["state"] = "ended"
                 if tr["entered_emitted"] and not tr["exited_emitted"]:
-                    exit_evt = {
+                    self._pending_exit_events.append({
                         "type": "exit",
                         "track_id": int(tid),
                         "frame": int(current_frame_num),
                         "class_id": int(tr["majority_class"]),
-                    }
-                    self._pending_exit_events.append(exit_evt)
+                    })
                     tr["exited_emitted"] = True
                 del self.tracks[tid]
 
@@ -187,8 +184,11 @@ class Stats:
         now = time.time()
         if now - self.last_report_time >= 1.0:
             elapsed_total = now - self.start_time
-            fps_avg = self.frame_count / elapsed_total
-            self._current_fps = (self.frame_count - self._frames_at_last_report) / (now - self.last_report_time)
+            fps_avg = self.frame_count / elapsed_total if elapsed_total > 0 else 0.0
+            self._current_fps = (
+                (self.frame_count - self._frames_at_last_report) / (now - self.last_report_time)
+                if (now - self.last_report_time) > 0 else 0.0
+            )
 
             class_counts_unique = defaultdict(int)
             confirmed_count = 0
@@ -200,21 +200,8 @@ class Stats:
             self._last_class_counts_unique = class_counts_unique
             self._last_confirmed_count = confirmed_count
 
-            cls_summary = " ".join(
-                f"{CLASS_NAMES[i]}={class_counts_unique[i]}"
-                for i in range(len(CLASS_NAMES))
-            )
-
-            mqtt_info = ""
+            # stats topic publish (1Hz)
             if self._mqtt:
-                mstats = self._mqtt.get_stats()
-                conn = "✓" if self._mqtt.is_connected else "✗"
-                mqtt_info = (
-                    f" | MQTT {conn} pub={mstats['published']} "
-                    f"evt={mstats['events_published']} "
-                    f"q={self._mqtt.queue_size} drop={mstats['dropped']}"
-                )
-
                 life = self.get_lifecycle_snapshot()
                 self._mqtt.publish_stats(
                     fps=self._current_fps,
@@ -227,44 +214,53 @@ class Stats:
                     },
                 )
 
+            cls_summary = " ".join(
+                f"{CLASS_NAMES[i]}={class_counts_unique[i]}" for i in range(len(CLASS_NAMES))
+            )
+
+            mqtt_info = ""
+            if self._mqtt:
+                mstats = self._mqtt.get_stats()
+                conn = "✓" if self._mqtt.is_connected else "✗"
+                mqtt_info = (
+                    f" | MQTT {conn} pub={mstats['published']} "
+                    f"evt={mstats['events_published']} "
+                    f"q={self._mqtt.queue_size} drop={mstats['dropped']}"
+                )
+
             print(
                 f"[{time.strftime('%H:%M:%S')}] "
                 f"FPS: {self._current_fps:5.1f}/{fps_avg:5.1f} | "
                 f"Frame: {self.frame_count:6d} | "
                 f"Araç: {confirmed_count:4d} | "
-                f"{cls_summary}"
-                f"{mqtt_info}"
+                f"{cls_summary}{mqtt_info}"
             )
 
             self.last_report_time = now
             self._frames_at_last_report = self.frame_count
 
-    def drain_pending_enter_events(self) -> list:
-        if not self._pending_enter_events:
-            return []
+    def drain_pending_enter_events(self):
         evts = self._pending_enter_events[:]
         self._pending_enter_events.clear()
         return evts
 
-    def drain_pending_exit_events(self) -> list:
-        if not self._pending_exit_events:
-            return []
+    def drain_pending_exit_events(self):
         evts = self._pending_exit_events[:]
         self._pending_exit_events.clear()
         return evts
 
     @property
-    def current_fps(self) -> float:
+    def current_fps(self):
         return self._current_fps
 
     @property
-    def unique_vehicle_count(self) -> int:
+    def unique_vehicle_count(self):
         return self._last_confirmed_count
 
-    def get_class_summary(self) -> dict:
+    def get_class_summary(self):
         return dict(self._last_class_counts_unique)
 
-    def get_lifecycle_snapshot(self) -> dict:
+    def get_lifecycle_snapshot(self):
         tentative = confirmed = lost = 0
         for tr in self.tracks.values():
             st = tr["state"]
@@ -281,6 +277,10 @@ class Stats:
             "active_total": len(self.tracks),
         }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Probe
+# ─────────────────────────────────────────────────────────────────────────────
 
 def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
     def probe(pad, info, u_data):
@@ -301,8 +301,8 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
 
             track_id_class_pairs = []
             raw_detection_count = 0
-            detections_in_frame = []
-            mqtt_detections = []
+            mqtt_detections = []   # active object candidates
+            debug_lines = []
 
             l_obj = frame_meta.obj_meta_list
             while l_obj is not None:
@@ -314,7 +314,6 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
                 cls_id = obj_meta.class_id
                 track_id = obj_meta.object_id
                 cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else f"cls{cls_id}"
-
                 raw_detection_count += 1
 
                 if track_id != TRACK_ID_UNASSIGNED:
@@ -323,18 +322,16 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
                     mqtt_detections.append({
                         "track_id": int(track_id),
                         "class": cls_name,
-                        "confidence": round(float(obj_meta.confidence), 3),
+                        "confidence": round(float(obj_meta.confidence), 2),
                         "bbox": [int(r.left), int(r.top), int(r.width), int(r.height)],
                         "track_state": "active",
                     })
 
-                if debug:
-                    r = obj_meta.rect_params
-                    track_str = f"id={track_id}" if track_id != TRACK_ID_UNASSIGNED else "id=yeni"
-                    detections_in_frame.append(
-                        f"{cls_name}[{track_str}] conf={obj_meta.confidence:.2f} "
-                        f"bbox=({int(r.left)},{int(r.top)},{int(r.width)},{int(r.height)})"
-                    )
+                    if debug:
+                        debug_lines.append(
+                            f"{cls_name}[id={track_id}] conf={obj_meta.confidence:.2f} "
+                            f"bbox=({int(r.left)},{int(r.top)},{int(r.width)},{int(r.height)})"
+                        )
 
                 try:
                     l_obj = l_obj.next
@@ -343,11 +340,13 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
 
             stats.on_frame(int(frame_meta.frame_num), raw_detection_count, track_id_class_pairs)
 
-            pending_enters = stats.drain_pending_enter_events()
-            for e in pending_enters:
+            # enter/exit event objeleri
+            event_objects = []
+
+            for e in stats.drain_pending_enter_events():
                 cls_id = e["class_id"]
                 cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else f"cls{cls_id}"
-                mqtt_detections.append({
+                event_objects.append({
                     "track_id": e["track_id"],
                     "class": cls_name,
                     "confidence": 0.0,
@@ -355,11 +354,10 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
                     "track_state": "enter",
                 })
 
-            pending_exits = stats.drain_pending_exit_events()
-            for e in pending_exits:
+            for e in stats.drain_pending_exit_events():
                 cls_id = e["class_id"]
                 cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else f"cls{cls_id}"
-                mqtt_detections.append({
+                event_objects.append({
                     "track_id": e["track_id"],
                     "class": cls_name,
                     "confidence": 0.0,
@@ -367,18 +365,22 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
                     "track_state": "exit",
                 })
 
-            has_events = any(d.get("track_state") in ("enter", "exit") for d in mqtt_detections)
+            has_events = len(event_objects) > 0
             should_publish = (frame_meta.frame_num % PUBLISH_EVERY_N_FRAMES == 0) or has_events
+
+            # ACTIVE-ONLY detections
+            active_only = [d for d in mqtt_detections if d.get("track_state") == "active"]
 
             if mqtt_publisher is not None and should_publish:
                 mqtt_publisher.publish_detections(
                     frame_id=int(frame_meta.frame_num),
                     fps=stats.current_fps,
-                    detections=mqtt_detections,
+                    detections=active_only,
+                    event_objects=event_objects,
                 )
 
-            if debug and detections_in_frame:
-                print(f"  └─ frame#{frame_meta.frame_num}: " + ", ".join(detections_in_frame))
+            if debug and debug_lines:
+                print(f"  └─ frame#{frame_meta.frame_num}: " + ", ".join(debug_lines))
 
             try:
                 l_frame = l_frame.next
@@ -389,6 +391,10 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
 
     return probe
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_pipeline(args):
     if args.no_display and args.no_rtsp:
@@ -461,26 +467,26 @@ def build_pipeline(args):
     print(f"  Tracker:  NvSORT ({tracker_config})")
     print(f"  Display:  {'kapalı' if args.no_display else 'aktif'}")
     if args.no_rtsp:
-        print("  RTSP:     kapalı")
+        rtsp_info = "kapalı"
     else:
         rtsp_host = args.rtsp_bind if args.rtsp_bind != "0.0.0.0" else "<jetson-ip>"
-        print(f"  RTSP:     rtsp://{rtsp_host}:{args.rtsp_port}{RTSP_MOUNT}")
-        print(f"  RTSP bind: {args.rtsp_bind}")
+        rtsp_info = f"rtsp://{rtsp_host}:{args.rtsp_port}{RTSP_MOUNT}"
 
+    print(f"  RTSP:     {rtsp_info}")
     print(f"  MQTT:     {'kapalı' if args.no_mqtt else f'{args.mqtt_host}:{args.mqtt_port}'}")
-    print(f"  Topic(detections): {'-' if args.no_mqtt else f'highway/telemetry/{args.sensor_id}/detections'}")
-    print(f"  Topic(stats):      {'-' if args.no_mqtt else f'highway/telemetry/{args.sensor_id}/stats'}")
-    print(f"  Topic(status):     {'-' if args.no_mqtt else f'highway/sensors/{args.sensor_id}/status'}")
-    print(f"  Topic(meta):       {'-' if args.no_mqtt else f'highway/sensors/{args.sensor_id}/meta'}")
-    print(f"  Topic(heartbeat):  {'-' if args.no_mqtt else f'highway/sensors/{args.sensor_id}/heartbeat'}")
-    print(f"  Topic(enter):      {'-' if args.no_mqtt else f'highway/events/{args.sensor_id}/vehicle/enter'}")
-    print(f"  Topic(exit):       {'-' if args.no_mqtt else f'highway/events/{args.sensor_id}/vehicle/exit'}")
-    print(f"  Topic(cmd req):    {'-' if args.no_mqtt else f'highway/commands/{args.sensor_id}/request'}")
-    print(f"  Topic(cmd resp):   {'-' if args.no_mqtt else f'highway/commands/{args.sensor_id}/response'}")
+    if not args.no_mqtt:
+        print(f"  Topic(detections): highway/telemetry/{args.sensor_id}/detections")
+        print(f"  Topic(stats):      highway/telemetry/{args.sensor_id}/stats")
+        print(f"  Topic(status):     highway/sensors/{args.sensor_id}/status")
+        print(f"  Topic(meta):       highway/sensors/{args.sensor_id}/meta")
+        print(f"  Topic(heartbeat):  highway/sensors/{args.sensor_id}/heartbeat")
+        print(f"  Topic(enter):      highway/events/{args.sensor_id}/vehicle/enter")
+        print(f"  Topic(exit):       highway/events/{args.sensor_id}/vehicle/exit")
+        print(f"  Topic(cmd req):    highway/commands/{args.sensor_id}/request")
+        print(f"  Topic(cmd resp):   highway/commands/{args.sensor_id}/response")
     print(f"  Publish:  her {PUBLISH_EVERY_N_FRAMES} frame (~{CAMERA_FPS // PUBLISH_EVERY_N_FRAMES} msg/sn)")
     print(f"  Confirm:  min_hits={TRACK_CONFIRM_MIN_HITS}")
     print(f"  TTL:      lost={TRACK_LOST_TTL_FRAMES} end={TRACK_END_TTL_FRAMES}")
-    print(f"  copy-hw:  {chw} (JP6.2 workaround)")
     print(f"  Debug:    {args.debug}")
 
     try:
@@ -497,18 +503,20 @@ def start_rtsp_server(port, mount_path, udp_port, bind_address="0.0.0.0"):
 
     factory = GstRtspServer.RTSPMediaFactory()
     factory.set_launch(
-        f"( udpsrc name=pay0 port={udp_port} buffer-size=524288 "
-        f'caps="application/x-rtp, media=video, clock-rate=90000, '
-        f'encoding-name=H264, payload=96" )'
+        f'( udpsrc name=pay0 port={udp_port} buffer-size=524288 '
+        f'caps="application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96" )'
     )
     factory.set_shared(True)
 
     mounts = server.get_mount_points()
     mounts.add_factory(mount_path, factory)
-
     server.attach(None)
     return server
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
@@ -555,11 +563,6 @@ def main():
         elif t == Gst.MessageType.WARNING:
             warn, _ = msg.parse_warning()
             print(f"[uyarı] {warn.message}")
-        elif t == Gst.MessageType.STATE_CHANGED:
-            if msg.src == pipeline:
-                _, new, _ = msg.parse_state_changed()
-                if new == Gst.State.PLAYING:
-                    print("[bilgi] Pipeline aktif — Ctrl+C ile kapat\n")
         return True
 
     bus = pipeline.get_bus()
@@ -568,8 +571,6 @@ def main():
 
     if not args.no_rtsp:
         _ = start_rtsp_server(args.rtsp_port, RTSP_MOUNT, RTSP_UDP_PORT, args.rtsp_bind)
-        rtsp_host = args.rtsp_bind if args.rtsp_bind != "0.0.0.0" else "<jetson-ip>"
-        print(f"[bilgi] RTSP sunucu hazır: rtsp://{rtsp_host}:{args.rtsp_port}{RTSP_MOUNT}")
 
     print("[bilgi] Engine yükleniyor...")
     pipeline.set_state(Gst.State.PLAYING)
