@@ -2,42 +2,21 @@
 """
 Highway Vehicle Detection — Jetson Orin Nano + DeepStream + YOLO26 + MQTT
 
-Pipeline:
-    B0495C USB kamera
-        -> nvinfer (YOLO26 TensorRT)
-        -> nvtracker (NvSORT)
-        -> nvdsosd
-        -> tee
-            ├─ (default) yerel ekran
-            └─ (default) x264enc + RTSP yayını -> rtsp://jetson:8554/stream
+Gerçek zamanlı + hızlı profil:
+- TRACK_CONFIRM_MIN_HITS = 1  (ilk görüldüğü anda confirmed)
+- PUBLISH_EVERY_N_FRAMES = 3  (~10 msg/sn @30 FPS)
 
-NOT — sınıf sayımı: Her track_id BİR kez sayılır.
-Bir track birden fazla frame'de farklı sınıflarla tespit edilebilir
-(model bazen kararsız), bu durumda çoğunluk oyu kullanılır.
-
-Workaround: JP6.2 nvbuf bug'u için tüm nvvideoconvert'lerde copy-hw=2
-
-Kullanım:
-    python3 highway_detection.py                          # default
-    python3 highway_detection.py --model n
-    python3 highway_detection.py --debug
-    python3 highway_detection.py --no-display
-    python3 highway_detection.py --no-rtsp
-    python3 highway_detection.py --no-mqtt
-    python3 highway_detection.py --mqtt-host pi5.local
-
-Test:
-    mosquitto_sub -h localhost -t 'highway/#' -v
-
-VLC ile RTSP izleme (LAN'dan):
-    vlc rtsp://<JETSON_IP>:8554/stream
+Exit event mantığı:
+- Track END_TTL'e düşerse "exit" olayı bir kez üretilir.
+- Exit olayı MQTT'ye publish edildikten sonra pending listeden silinir.
+- Aynı exit tekrar publish edilmez.
 """
 
 import argparse
 import os
 import sys
 import time
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque
 
 import gi
 gi.require_version("Gst", "1.0")
@@ -74,10 +53,17 @@ DEFAULT_MQTT_HOST = "localhost"
 DEFAULT_MQTT_PORT = 1883
 DEFAULT_SENSOR_ID = "yhnt-jetson-01"
 
-PUBLISH_EVERY_N_FRAMES = 6
+# Gerçek zamanlı + hızlı
+PUBLISH_EVERY_N_FRAMES = 3
 TRACK_ID_UNASSIGNED = 0xFFFFFFFFFFFFFFFF
 
 CLASS_NAMES = ["others", "car", "van", "bus"]
+
+# ── Track lifecycle ayarları (hafif / FPS dostu) ─────────────────────────────
+TRACK_CONFIRM_MIN_HITS = 1
+TRACK_LOST_TTL_FRAMES = 45
+TRACK_END_TTL_FRAMES = 90
+TRACK_HISTORY_MAXLEN = 30
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -100,42 +86,107 @@ def parse_args():
     return parser.parse_args()
 
 
-# ─── İstatistik toplayıcı — sınıf sayımı track_id başına ─────────────────────
-
 class Stats:
     """
-    Sınıf sayımı mantığı:
-      - Her track_id'nin tespit edildiği sınıfların tarihçesi tutulur (Counter)
-      - O track'in "şu anki sınıfı" = en çok tespit edildiği sınıf (majority vote)
-      - Toplam sınıf sayımı = her benzersiz track'in çoğunluk sınıfı sayılır
-
-    Örn: track 5, 30 frame'de "car", 2 frame'de "others" tespit edildi.
-    Sonuç: track 5 = "car" (çoğunluk), sınıf sayımına 1 car ekler (frame sayısı değil).
+    Lifecycle + sınıf sayımı:
+      - tentative -> confirmed -> lost -> ended
+      - confirmed olanlar benzersiz araç sayımına girer
+      - sınıf = son TRACK_HISTORY_MAXLEN gözlemde majority vote
     """
 
     def __init__(self, mqtt_publisher=None):
         self.frame_count = 0
-        # Her track için sınıf histogramı: track_id -> Counter({class_id: count})
-        self.track_class_history = defaultdict(Counter)
         self.start_time = time.time()
         self.last_report_time = self.start_time
         self._frames_at_last_report = 0
         self._mqtt = mqtt_publisher
         self._current_fps = 0.0
-        # Toplam tespit (raw, her frame'deki bbox sayısı toplamı)
         self.total_raw_detections = 0
 
-    def on_frame(self, raw_detection_count, track_id_class_pairs):
-        """
-        track_id_class_pairs: list of (track_id, class_id)
-        Her frame için bu liste pad probe'tan gelir.
-        """
+        # tid -> track data
+        self.tracks = {}
+
+        # Son rapor snapshot
+        self._last_class_counts_unique = defaultdict(int)
+        self._last_confirmed_count = 0
+
+        # Event ring buffer (debug/analiz)
+        self._events = deque(maxlen=1000)
+
+        # MQTT publish bekleyen exit eventleri
+        self._pending_exit_events = []
+
+    def _ensure_track(self, tid, cls_id, frame_num):
+        if tid not in self.tracks:
+            self.tracks[tid] = {
+                "state": "tentative",
+                "first_seen": frame_num,
+                "last_seen": frame_num,
+                "hits": 1,
+                "misses": 0,
+                "class_hist": Counter([cls_id]),
+                "class_recent": deque([cls_id], maxlen=TRACK_HISTORY_MAXLEN),
+                "majority_class": cls_id,
+                "entered_emitted": False,
+                "exited_emitted": False,
+            }
+            return
+
+        tr = self.tracks[tid]
+        tr["last_seen"] = frame_num
+        tr["hits"] += 1
+        tr["misses"] = 0
+        tr["class_hist"][cls_id] += 1
+        tr["class_recent"].append(cls_id)
+        tr["majority_class"] = Counter(tr["class_recent"]).most_common(1)[0][0]
+
+    def _transition_states(self, current_frame_num, seen_tids):
+        for tid, tr in list(self.tracks.items()):
+            if tid in seen_tids:
+                if tr["state"] == "tentative" and tr["hits"] >= TRACK_CONFIRM_MIN_HITS:
+                    tr["state"] = "confirmed"
+                    if not tr["entered_emitted"]:
+                        self._events.append({
+                            "type": "enter",
+                            "track_id": int(tid),
+                            "frame": int(current_frame_num),
+                            "class_id": int(tr["majority_class"]),
+                        })
+                        tr["entered_emitted"] = True
+                elif tr["state"] == "lost":
+                    tr["state"] = "confirmed"
+                continue
+
+            # görülmediyse miss hesabı
+            tr["misses"] = current_frame_num - tr["last_seen"]
+
+            if tr["state"] in ("tentative", "confirmed") and tr["misses"] >= TRACK_LOST_TTL_FRAMES:
+                tr["state"] = "lost"
+
+            if tr["misses"] >= TRACK_END_TTL_FRAMES:
+                tr["state"] = "ended"
+                if tr["entered_emitted"] and not tr["exited_emitted"]:
+                    exit_evt = {
+                        "type": "exit",
+                        "track_id": int(tid),
+                        "frame": int(current_frame_num),
+                        "class_id": int(tr["majority_class"]),
+                    }
+                    self._events.append(exit_evt)
+                    self._pending_exit_events.append(exit_evt)  # 1 kez publish için queue
+                    tr["exited_emitted"] = True
+                del self.tracks[tid]
+
+    def on_frame(self, frame_num, raw_detection_count, track_id_class_pairs):
         self.frame_count += 1
         self.total_raw_detections += raw_detection_count
 
-        # Her track'in sınıf histogramını güncelle
+        seen_tids = set()
         for tid, cls_id in track_id_class_pairs:
-            self.track_class_history[tid][cls_id] += 1
+            self._ensure_track(tid, cls_id, frame_num)
+            seen_tids.add(tid)
+
+        self._transition_states(frame_num, seen_tids)
 
         now = time.time()
         if now - self.last_report_time >= 1.0:
@@ -143,12 +194,15 @@ class Stats:
             fps_avg = self.frame_count / elapsed_total
             self._current_fps = (self.frame_count - self._frames_at_last_report) / (now - self.last_report_time)
 
-            # Her track için çoğunluk sınıfını bul, sınıf bazında say
             class_counts_unique = defaultdict(int)
-            for tid, cls_counter in self.track_class_history.items():
-                # En çok tespit edildiği sınıf
-                majority_class = cls_counter.most_common(1)[0][0]
-                class_counts_unique[majority_class] += 1
+            confirmed_count = 0
+            for tr in self.tracks.values():
+                if tr["state"] == "confirmed":
+                    confirmed_count += 1
+                    class_counts_unique[tr["majority_class"]] += 1
+
+            self._last_class_counts_unique = class_counts_unique
+            self._last_confirmed_count = confirmed_count
 
             cls_summary = " ".join(
                 f"{CLASS_NAMES[i]}={class_counts_unique[i]}"
@@ -157,21 +211,30 @@ class Stats:
 
             mqtt_info = ""
             if self._mqtt:
-                stats = self._mqtt.get_stats()
+                mstats = self._mqtt.get_stats()
                 conn = "✓" if self._mqtt.is_connected else "✗"
-                mqtt_info = (f" | MQTT {conn} pub={stats['published']} "
-                             f"q={self._mqtt.queue_size} drop={stats['dropped']}")
+                mqtt_info = (f" | MQTT {conn} pub={mstats['published']} "
+                             f"q={self._mqtt.queue_size} drop={mstats['dropped']}")
 
             print(
                 f"[{time.strftime('%H:%M:%S')}] "
                 f"FPS: {self._current_fps:5.1f}/{fps_avg:5.1f} | "
                 f"Frame: {self.frame_count:6d} | "
-                f"Araç: {len(self.track_class_history):4d} | "
+                f"Araç: {confirmed_count:4d} | "
                 f"{cls_summary}"
                 f"{mqtt_info}"
             )
+
             self.last_report_time = now
             self._frames_at_last_report = self.frame_count
+
+    def drain_pending_exit_events(self) -> list:
+        """Exit eventleri tek seferde alır ve pending listeden siler."""
+        if not self._pending_exit_events:
+            return []
+        evts = self._pending_exit_events[:]
+        self._pending_exit_events.clear()
+        return evts
 
     @property
     def current_fps(self) -> float:
@@ -179,18 +242,28 @@ class Stats:
 
     @property
     def unique_vehicle_count(self) -> int:
-        return len(self.track_class_history)
+        return self._last_confirmed_count
 
     def get_class_summary(self) -> dict:
-        """Her sınıfın benzersiz araç sayısı (oturum sonu raporu için)"""
-        result = defaultdict(int)
-        for tid, cls_counter in self.track_class_history.items():
-            majority_class = cls_counter.most_common(1)[0][0]
-            result[majority_class] += 1
-        return dict(result)
+        return dict(self._last_class_counts_unique)
 
+    def get_lifecycle_snapshot(self) -> dict:
+        tentative = confirmed = lost = 0
+        for tr in self.tracks.values():
+            st = tr["state"]
+            if st == "tentative":
+                tentative += 1
+            elif st == "confirmed":
+                confirmed += 1
+            elif st == "lost":
+                lost += 1
+        return {
+            "tentative": tentative,
+            "confirmed": confirmed,
+            "lost": lost,
+            "active_total": len(self.tracks),
+        }
 
-# ─── Pad probe ────────────────────────────────────────────────────────────────
 
 def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
     def probe(pad, info, u_data):
@@ -209,7 +282,7 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
             except StopIteration:
                 break
 
-            track_id_class_pairs = []   # (track_id, class_id) bu frame için
+            track_id_class_pairs = []
             raw_detection_count = 0
             detections_in_frame = []
             mqtt_detections = []
@@ -229,13 +302,13 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
 
                 if track_id != TRACK_ID_UNASSIGNED:
                     track_id_class_pairs.append((track_id, cls_id))
-
                     r = obj_meta.rect_params
                     mqtt_detections.append({
                         "track_id": int(track_id),
                         "class": cls_name,
                         "confidence": round(float(obj_meta.confidence), 3),
                         "bbox": [int(r.left), int(r.top), int(r.width), int(r.height)],
+                        "track_state": "active",
                     })
 
                 if debug:
@@ -251,9 +324,26 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
                 except StopIteration:
                     break
 
-            stats.on_frame(raw_detection_count, track_id_class_pairs)
+            # lifecycle güncelle
+            stats.on_frame(int(frame_meta.frame_num), raw_detection_count, track_id_class_pairs)
 
-            if mqtt_publisher is not None and frame_meta.frame_num % PUBLISH_EVERY_N_FRAMES == 0:
+            # pending exit eventleri tek seferde al + detections'a ekle
+            pending_exits = stats.drain_pending_exit_events()
+            for e in pending_exits:
+                cls_id = e["class_id"]
+                cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else f"cls{cls_id}"
+                mqtt_detections.append({
+                    "track_id": e["track_id"],
+                    "class": cls_name,
+                    "confidence": 0.0,
+                    "bbox": [0, 0, 0, 0],
+                    "track_state": "exit",
+                })
+
+            has_exit = any(d.get("track_state") == "exit" for d in mqtt_detections)
+            should_publish = (frame_meta.frame_num % PUBLISH_EVERY_N_FRAMES == 0) or has_exit
+
+            if mqtt_publisher is not None and should_publish:
                 mqtt_publisher.publish_detections(
                     frame_id=int(frame_meta.frame_num),
                     fps=stats.current_fps,
@@ -273,8 +363,6 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
     return probe
 
 
-# ─── Pipeline ─────────────────────────────────────────────────────────────────
-
 def build_pipeline(args):
     if args.no_display and args.no_rtsp:
         print("HATA: --no-display ve --no-rtsp birlikte kullanılamaz")
@@ -283,9 +371,11 @@ def build_pipeline(args):
     config_file = os.path.join(REPO_ROOT, "configs", f"config_infer_primary_yolo26{args.model}.txt")
     tracker_config = os.path.join(REPO_ROOT, "configs", "tracker_config.yml")
 
-    for path, label in [(config_file, "Inference config"),
-                        (tracker_config, "Tracker config"),
-                        (TRACKER_LIB, "Tracker library")]:
+    for path, label in [
+        (config_file, "Inference config"),
+        (tracker_config, "Tracker config"),
+        (TRACKER_LIB, "Tracker library"),
+    ]:
         if not os.path.exists(path):
             print(f"HATA: {label} bulunamadı: {path}")
             sys.exit(1)
@@ -339,32 +429,30 @@ def build_pipeline(args):
 
     pipeline_str = common + display_branch + rtsp_branch
 
-    print(f"Pipeline kuruluyor:")
+    print("Pipeline kuruluyor:")
     print(f"  Model:    yolo26{args.model}")
     print(f"  Tracker:  NvSORT ({tracker_config})")
     print(f"  Display:  {'kapalı' if args.no_display else 'aktif'}")
     print(f"  RTSP:     {'kapalı' if args.no_rtsp else f'rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT}'}")
-    print(f"  copy-hw:  {chw} (JP6.2 bug workaround)")
-    if args.no_mqtt:
-        print(f"  MQTT:     kapalı")
-    else:
-        print(f"  MQTT:     {args.mqtt_host}:{args.mqtt_port}")
-        print(f"  Topic:    highway/detections/{args.sensor_id}")
-    print(f"  Sayım:    track_id başına benzersiz")
+    print(f"  MQTT:     {'kapalı' if args.no_mqtt else f'{args.mqtt_host}:{args.mqtt_port}'}")
+    print(f"  Topic:    {'-' if args.no_mqtt else f'highway/detections/{args.sensor_id}'}")
+    print(f"  Publish:  her {PUBLISH_EVERY_N_FRAMES} frame (~{CAMERA_FPS // PUBLISH_EVERY_N_FRAMES} msg/sn)")
+    print(f"  Confirm:  min_hits={TRACK_CONFIRM_MIN_HITS}")
+    print(f"  TTL:      lost={TRACK_LOST_TTL_FRAMES} end={TRACK_END_TTL_FRAMES}")
+    print(f"  copy-hw:  {chw} (JP6.2 workaround)")
     print(f"  Debug:    {args.debug}")
 
     try:
-        pipeline = Gst.parse_launch(pipeline_str)
+        return Gst.parse_launch(pipeline_str)
     except GLib.Error as e:
         print(f"Pipeline parse hatası: {e}")
         sys.exit(1)
-
-    return pipeline
 
 
 def start_rtsp_server(port, mount_path, udp_port):
     server = GstRtspServer.RTSPServer()
     server.props.service = str(port)
+
     factory = GstRtspServer.RTSPMediaFactory()
     factory.set_launch(
         f"( udpsrc name=pay0 port={udp_port} buffer-size=524288 "
@@ -372,8 +460,10 @@ def start_rtsp_server(port, mount_path, udp_port):
         f'encoding-name=H264, payload=96" )'
     )
     factory.set_shared(True)
+
     mounts = server.get_mount_points()
     mounts.add_factory(mount_path, factory)
+
     server.attach(None)
     return server
 
@@ -385,7 +475,9 @@ def main():
     mqtt_publisher = None
     if not args.no_mqtt:
         mqtt_publisher = MqttPublisher(
-            host=args.mqtt_host, port=args.mqtt_port, sensor_id=args.sensor_id,
+            host=args.mqtt_host,
+            port=args.mqtt_port,
+            sensor_id=args.sensor_id,
         )
         mqtt_publisher.start()
 
@@ -393,30 +485,39 @@ def main():
     stats = Stats(mqtt_publisher=mqtt_publisher)
 
     osd = pipeline.get_by_name("osd")
+    if osd is None:
+        print("HATA: nvdsosd bulunamadı")
+        sys.exit(1)
+
     osd_sink_pad = osd.get_static_pad("sink")
+    if osd_sink_pad is None:
+        print("HATA: osd sink pad alınamadı")
+        sys.exit(1)
+
     probe_fn = make_osd_sink_pad_probe(stats, mqtt_publisher=mqtt_publisher, debug=args.debug)
     osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, probe_fn, 0)
 
     loop = GLib.MainLoop()
 
-    def on_message(bus, msg, loop):
+    def on_message(bus, msg, loop_ref):
         t = msg.type
         if t == Gst.MessageType.ERROR:
             err, debug = msg.parse_error()
             print(f"\n[HATA] {err.message}")
             if debug:
                 print(f"[DEBUG] {debug}")
-            loop.quit()
+            loop_ref.quit()
         elif t == Gst.MessageType.EOS:
-            loop.quit()
+            print("\n[bilgi] Stream bitti")
+            loop_ref.quit()
         elif t == Gst.MessageType.WARNING:
             warn, _ = msg.parse_warning()
             print(f"[uyarı] {warn.message}")
         elif t == Gst.MessageType.STATE_CHANGED:
             if msg.src == pipeline:
-                old, new, _ = msg.parse_state_changed()
+                _, new, _ = msg.parse_state_changed()
                 if new == Gst.State.PLAYING:
-                    print(f"[bilgi] Pipeline aktif — Ctrl+C ile kapat\n")
+                    print("[bilgi] Pipeline aktif — Ctrl+C ile kapat\n")
         return True
 
     bus = pipeline.get_bus()
@@ -424,7 +525,7 @@ def main():
     bus.connect("message", on_message, loop)
 
     if not args.no_rtsp:
-        rtsp_server = start_rtsp_server(args.rtsp_port, RTSP_MOUNT, RTSP_UDP_PORT)
+        _ = start_rtsp_server(args.rtsp_port, RTSP_MOUNT, RTSP_UDP_PORT)
         print(f"[bilgi] RTSP sunucu hazır: rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT}")
 
     print("[bilgi] Engine yükleniyor...")
@@ -436,21 +537,30 @@ def main():
         print("\n[bilgi] Kapatılıyor...")
 
     pipeline.set_state(Gst.State.NULL)
+
     if mqtt_publisher:
         mqtt_publisher.stop()
 
     total_time = time.time() - stats.start_time
     if stats.frame_count > 0:
-        print(f"\n─── Oturum özeti ───")
+        print("\n─── Oturum özeti ───")
         print(f"Toplam süre:         {total_time:.1f} sn")
         print(f"İşlenen frame:       {stats.frame_count}")
         print(f"Ortalama FPS:        {stats.frame_count / total_time:.2f}")
         print(f"Toplam tespit (raw): {stats.total_raw_detections}")
         print(f"Benzersiz araç:      {stats.unique_vehicle_count}")
-        print(f"Sınıf dağılımı (her aracı çoğunluk sınıfıyla bir kez sayar):")
+        print("Sınıf dağılımı (confirmed, unique):")
         cls_summary = stats.get_class_summary()
         for i, name in enumerate(CLASS_NAMES):
             print(f"  {name:10s}: {cls_summary.get(i, 0)}")
+
+        life = stats.get_lifecycle_snapshot()
+        print(
+            "Lifecycle (kapanış anı): "
+            f"tentative={life['tentative']} "
+            f"confirmed={life['confirmed']} "
+            f"lost={life['lost']}"
+        )
 
 
 if __name__ == "__main__":
