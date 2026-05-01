@@ -11,7 +11,7 @@ Bağlantı koparsa:
 - Bağlantı dönünce birikmiş mesajları gönderir
 
 Kullanım:
-    publisher = MqttPublisher(host="localhost", port=1883, sensor_id="yhnt-jetson-01")
+    publisher = MqttPublisher(host="localhost", port=1883, sensor_id="jetson01")
     publisher.start()
     publisher.publish_detections(frame_id, detections)
     # ...
@@ -49,7 +49,7 @@ class MqttPublisher:
         self,
         host: str = "localhost",
         port: int = 1883,
-        sensor_id: str = "yhnt-jetson-01",
+        sensor_id: str = "jetson01",
         topic_prefix: str = "highway/detections",
         max_queue_size: int = 1000,
         client_id: str | None = None,
@@ -71,6 +71,7 @@ class MqttPublisher:
         )
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
+        self._client.reconnect_delay_set(min_delay=1, max_delay=30)
 
         # Worker thread — queue'yu boşaltıp publish eder
         self._stop_flag = threading.Event()

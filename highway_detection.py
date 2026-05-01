@@ -51,7 +51,7 @@ TRACKER_HEIGHT = 544
 
 DEFAULT_MQTT_HOST = "localhost"
 DEFAULT_MQTT_PORT = 1883
-DEFAULT_SENSOR_ID = "yhnt-jetson-01"
+DEFAULT_SENSOR_ID = "jetson01"
 
 # Gerçek zamanlı + hızlı
 PUBLISH_EVERY_N_FRAMES = 3
