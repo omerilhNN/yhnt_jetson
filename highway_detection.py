@@ -2,23 +2,19 @@
 """
 Highway Vehicle Detection — Jetson Orin Nano + DeepStream + YOLO26 + MQTT
 
-Tailscale ağ topolojisi:
-- Jetson IP : 100.74.245.10  (publisher + RTSP server)
-- RPi5  IP  : 100.84.29.29   (broker + backend + RTSP client/relay)
+Topic yapısı (güncel):
+- highway/sensors/<sensor_id>/status            (QoS1 retained + LWT)
+- highway/sensors/<sensor_id>/meta              (QoS1 retained)
+- highway/sensors/<sensor_id>/heartbeat         (QoS0 periyodik)
+- highway/telemetry/<sensor_id>/detections      (QoS0 yüksek frekans)
+- highway/telemetry/<sensor_id>/stats           (QoS0 ~1 Hz)
+- highway/events/<sensor_id>/vehicle/enter      (QoS1)
+- highway/events/<sensor_id>/vehicle/exit       (QoS1)
+- highway/commands/<sensor_id>/request          (RPi5 -> Jetson, subscribe)
+- highway/commands/<sensor_id>/response         (Jetson -> RPi5, QoS1)
 
-Bağlantı yönleri:
-- MQTT : Jetson → RPi5  (Jetson outbound, broker pasif kabul eder)
-- RTSP : RPi5  → Jetson (RPi5 mediamtx, Jetson'ın RTSP sunucusunu pull eder)
-
-Gerçek zamanlı + hızlı profil:
-- TRACK_CONFIRM_MIN_HITS = 1  (ilk görüldüğü anda confirmed)
-- PUBLISH_EVERY_N_FRAMES = 3  (~10 msg/sn @30 FPS)
-
-Exit event mantığı:
-- Track END_TTL'e düşerse "exit" olayı bir kez üretilir.
-- Exit olayı MQTT'ye publish edildikten sonra pending listeden silinir.
-- Aynı exit tekrar publish edilmez.
-- Exit'ler ayrıca highway/events/<sensor_id> topic'ine QoS=1 gönderilir.
+NOT:
+- detections topic'i özellikle "highway/telemetry/<sensor_id>/detections" olarak korunmuştur.
 """
 
 import argparse
@@ -59,23 +55,17 @@ TRACKER_WIDTH = 960
 TRACKER_HEIGHT = 544
 
 # ── Tailscale defaultları ────────────────────────────────────────────────────
-# RPi5'in tailnet IP'si — broker burada koşuyor
 DEFAULT_MQTT_HOST = "100.84.29.29"
 DEFAULT_MQTT_PORT = 1883
-DEFAULT_SENSOR_ID = "yhnt-jetson-01"
+DEFAULT_SENSOR_ID = "jetson01"
 
-# Jetson kendi RTSP sunucusunu sadece tailnet'e açabilir.
-# "0.0.0.0" → tüm arayüzler (LAN + Tailscale + Wi-Fi)
-# "100.74.245.10" → sadece Tailscale arayüzü (önerilen, daha güvenli)
 DEFAULT_RTSP_BIND = "0.0.0.0"
 
-# Gerçek zamanlı + hızlı
 PUBLISH_EVERY_N_FRAMES = 3
 TRACK_ID_UNASSIGNED = 0xFFFFFFFFFFFFFFFF
 
 CLASS_NAMES = ["others", "car", "van", "bus"]
 
-# ── Track lifecycle ayarları (hafif / FPS dostu) ─────────────────────────────
 TRACK_CONFIRM_MIN_HITS = 1
 TRACK_LOST_TTL_FRAMES = 45
 TRACK_END_TTL_FRAMES = 90
@@ -86,7 +76,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Highway araç tespit pipeline'ı + MQTT telemetri (Tailscale ready)",
+        description="Highway araç tespit pipeline'ı + MQTT telemetri",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", choices=["s", "n"], default="s")
@@ -98,28 +88,16 @@ def parse_args():
     parser.add_argument(
         "--rtsp-bind",
         default=DEFAULT_RTSP_BIND,
-        help="RTSP sunucusu hangi IP'ye bind olsun. "
-             "Tailscale-only erişim için '100.74.245.10' kullan.",
+        help="RTSP sunucusu hangi IP'ye bind olsun.",
     )
     parser.add_argument("--no-mqtt", action="store_true")
-    parser.add_argument(
-        "--mqtt-host",
-        default=DEFAULT_MQTT_HOST,
-        help="Broker hostname/IP. RPi5'in tailnet IP'si veya MagicDNS adı.",
-    )
+    parser.add_argument("--mqtt-host", default=DEFAULT_MQTT_HOST)
     parser.add_argument("--mqtt-port", type=int, default=DEFAULT_MQTT_PORT)
     parser.add_argument("--sensor-id", default=DEFAULT_SENSOR_ID)
     return parser.parse_args()
 
 
 class Stats:
-    """
-    Lifecycle + sınıf sayımı:
-      - tentative -> confirmed -> lost -> ended
-      - confirmed olanlar benzersiz araç sayımına girer
-      - sınıf = son TRACK_HISTORY_MAXLEN gözlemde majority vote
-    """
-
     def __init__(self, mqtt_publisher=None):
         self.frame_count = 0
         self.start_time = time.time()
@@ -129,17 +107,12 @@ class Stats:
         self._current_fps = 0.0
         self.total_raw_detections = 0
 
-        # tid -> track data
         self.tracks = {}
 
-        # Son rapor snapshot
         self._last_class_counts_unique = defaultdict(int)
         self._last_confirmed_count = 0
 
-        # Event ring buffer (debug/analiz)
-        self._events = deque(maxlen=1000)
-
-        # MQTT publish bekleyen exit eventleri
+        self._pending_enter_events = []
         self._pending_exit_events = []
 
     def _ensure_track(self, tid, cls_id, frame_num):
@@ -150,7 +123,6 @@ class Stats:
                 "last_seen": frame_num,
                 "hits": 1,
                 "misses": 0,
-                "class_hist": Counter([cls_id]),
                 "class_recent": deque([cls_id], maxlen=TRACK_HISTORY_MAXLEN),
                 "majority_class": cls_id,
                 "entered_emitted": False,
@@ -162,7 +134,6 @@ class Stats:
         tr["last_seen"] = frame_num
         tr["hits"] += 1
         tr["misses"] = 0
-        tr["class_hist"][cls_id] += 1
         tr["class_recent"].append(cls_id)
         tr["majority_class"] = Counter(tr["class_recent"]).most_common(1)[0][0]
 
@@ -172,18 +143,18 @@ class Stats:
                 if tr["state"] == "tentative" and tr["hits"] >= TRACK_CONFIRM_MIN_HITS:
                     tr["state"] = "confirmed"
                     if not tr["entered_emitted"]:
-                        self._events.append({
+                        enter_evt = {
                             "type": "enter",
                             "track_id": int(tid),
                             "frame": int(current_frame_num),
                             "class_id": int(tr["majority_class"]),
-                        })
+                        }
+                        self._pending_enter_events.append(enter_evt)
                         tr["entered_emitted"] = True
                 elif tr["state"] == "lost":
                     tr["state"] = "confirmed"
                 continue
 
-            # görülmediyse miss hesabı
             tr["misses"] = current_frame_num - tr["last_seen"]
 
             if tr["state"] in ("tentative", "confirmed") and tr["misses"] >= TRACK_LOST_TTL_FRAMES:
@@ -198,8 +169,7 @@ class Stats:
                         "frame": int(current_frame_num),
                         "class_id": int(tr["majority_class"]),
                     }
-                    self._events.append(exit_evt)
-                    self._pending_exit_events.append(exit_evt)  # 1 kez publish için queue
+                    self._pending_exit_events.append(exit_evt)
                     tr["exited_emitted"] = True
                 del self.tracks[tid]
 
@@ -239,9 +209,23 @@ class Stats:
             if self._mqtt:
                 mstats = self._mqtt.get_stats()
                 conn = "✓" if self._mqtt.is_connected else "✗"
-                mqtt_info = (f" | MQTT {conn} pub={mstats['published']} "
-                             f"evt={mstats['events_published']} "
-                             f"q={self._mqtt.queue_size} drop={mstats['dropped']}")
+                mqtt_info = (
+                    f" | MQTT {conn} pub={mstats['published']} "
+                    f"evt={mstats['events_published']} "
+                    f"q={self._mqtt.queue_size} drop={mstats['dropped']}"
+                )
+
+                life = self.get_lifecycle_snapshot()
+                self._mqtt.publish_stats(
+                    fps=self._current_fps,
+                    queue_size=self._mqtt.queue_size,
+                    extra={
+                        "tracks_confirmed": life["confirmed"],
+                        "tracks_lost": life["lost"],
+                        "tracks_tentative": life["tentative"],
+                        "tracks_active_total": life["active_total"],
+                    },
+                )
 
             print(
                 f"[{time.strftime('%H:%M:%S')}] "
@@ -255,8 +239,14 @@ class Stats:
             self.last_report_time = now
             self._frames_at_last_report = self.frame_count
 
+    def drain_pending_enter_events(self) -> list:
+        if not self._pending_enter_events:
+            return []
+        evts = self._pending_enter_events[:]
+        self._pending_enter_events.clear()
+        return evts
+
     def drain_pending_exit_events(self) -> list:
-        """Exit eventleri tek seferde alır ve pending listeden siler."""
         if not self._pending_exit_events:
             return []
         evts = self._pending_exit_events[:]
@@ -351,10 +341,20 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
                 except StopIteration:
                     break
 
-            # lifecycle güncelle
             stats.on_frame(int(frame_meta.frame_num), raw_detection_count, track_id_class_pairs)
 
-            # pending exit eventleri tek seferde al + detections'a ekle
+            pending_enters = stats.drain_pending_enter_events()
+            for e in pending_enters:
+                cls_id = e["class_id"]
+                cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else f"cls{cls_id}"
+                mqtt_detections.append({
+                    "track_id": e["track_id"],
+                    "class": cls_name,
+                    "confidence": 0.0,
+                    "bbox": [0, 0, 0, 0],
+                    "track_state": "enter",
+                })
+
             pending_exits = stats.drain_pending_exit_events()
             for e in pending_exits:
                 cls_id = e["class_id"]
@@ -367,8 +367,8 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
                     "track_state": "exit",
                 })
 
-            has_exit = any(d.get("track_state") == "exit" for d in mqtt_detections)
-            should_publish = (frame_meta.frame_num % PUBLISH_EVERY_N_FRAMES == 0) or has_exit
+            has_events = any(d.get("track_state") in ("enter", "exit") for d in mqtt_detections)
+            should_publish = (frame_meta.frame_num % PUBLISH_EVERY_N_FRAMES == 0) or has_events
 
             if mqtt_publisher is not None and should_publish:
                 mqtt_publisher.publish_detections(
@@ -461,13 +461,22 @@ def build_pipeline(args):
     print(f"  Tracker:  NvSORT ({tracker_config})")
     print(f"  Display:  {'kapalı' if args.no_display else 'aktif'}")
     if args.no_rtsp:
-        print(f"  RTSP:     kapalı")
+        print("  RTSP:     kapalı")
     else:
         rtsp_host = args.rtsp_bind if args.rtsp_bind != "0.0.0.0" else "<jetson-ip>"
         print(f"  RTSP:     rtsp://{rtsp_host}:{args.rtsp_port}{RTSP_MOUNT}")
         print(f"  RTSP bind: {args.rtsp_bind}")
+
     print(f"  MQTT:     {'kapalı' if args.no_mqtt else f'{args.mqtt_host}:{args.mqtt_port}'}")
-    print(f"  Topic:    {'-' if args.no_mqtt else f'highway/telemetry/{args.sensor_id}/detections'}")
+    print(f"  Topic(detections): {'-' if args.no_mqtt else f'highway/telemetry/{args.sensor_id}/detections'}")
+    print(f"  Topic(stats):      {'-' if args.no_mqtt else f'highway/telemetry/{args.sensor_id}/stats'}")
+    print(f"  Topic(status):     {'-' if args.no_mqtt else f'highway/sensors/{args.sensor_id}/status'}")
+    print(f"  Topic(meta):       {'-' if args.no_mqtt else f'highway/sensors/{args.sensor_id}/meta'}")
+    print(f"  Topic(heartbeat):  {'-' if args.no_mqtt else f'highway/sensors/{args.sensor_id}/heartbeat'}")
+    print(f"  Topic(enter):      {'-' if args.no_mqtt else f'highway/events/{args.sensor_id}/vehicle/enter'}")
+    print(f"  Topic(exit):       {'-' if args.no_mqtt else f'highway/events/{args.sensor_id}/vehicle/exit'}")
+    print(f"  Topic(cmd req):    {'-' if args.no_mqtt else f'highway/commands/{args.sensor_id}/request'}")
+    print(f"  Topic(cmd resp):   {'-' if args.no_mqtt else f'highway/commands/{args.sensor_id}/response'}")
     print(f"  Publish:  her {PUBLISH_EVERY_N_FRAMES} frame (~{CAMERA_FPS // PUBLISH_EVERY_N_FRAMES} msg/sn)")
     print(f"  Confirm:  min_hits={TRACK_CONFIRM_MIN_HITS}")
     print(f"  TTL:      lost={TRACK_LOST_TTL_FRAMES} end={TRACK_END_TTL_FRAMES}")
@@ -484,7 +493,6 @@ def build_pipeline(args):
 def start_rtsp_server(port, mount_path, udp_port, bind_address="0.0.0.0"):
     server = GstRtspServer.RTSPServer()
     server.props.service = str(port)
-    # Sadece belirli arayüze bind — Tailscale-only senaryosu için
     server.props.address = bind_address
 
     factory = GstRtspServer.RTSPMediaFactory()
@@ -536,10 +544,10 @@ def main():
     def on_message(bus, msg, loop_ref):
         t = msg.type
         if t == Gst.MessageType.ERROR:
-            err, debug = msg.parse_error()
+            err, debug_msg = msg.parse_error()
             print(f"\n[HATA] {err.message}")
-            if debug:
-                print(f"[DEBUG] {debug}")
+            if debug_msg:
+                print(f"[DEBUG] {debug_msg}")
             loop_ref.quit()
         elif t == Gst.MessageType.EOS:
             print("\n[bilgi] Stream bitti")
@@ -588,14 +596,6 @@ def main():
         cls_summary = stats.get_class_summary()
         for i, name in enumerate(CLASS_NAMES):
             print(f"  {name:10s}: {cls_summary.get(i, 0)}")
-
-        life = stats.get_lifecycle_snapshot()
-        print(
-            "Lifecycle (kapanış anı): "
-            f"tentative={life['tentative']} "
-            f"confirmed={life['confirmed']} "
-            f"lost={life['lost']}"
-        )
 
 
 if __name__ == "__main__":
