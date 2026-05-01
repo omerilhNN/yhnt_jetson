@@ -2,6 +2,14 @@
 """
 Highway Vehicle Detection — Jetson Orin Nano + DeepStream + YOLO26 + MQTT
 
+Tailscale ağ topolojisi:
+- Jetson IP : 100.74.245.10  (publisher + RTSP server)
+- RPi5  IP  : 100.84.29.29   (broker + backend + RTSP client/relay)
+
+Bağlantı yönleri:
+- MQTT : Jetson → RPi5  (Jetson outbound, broker pasif kabul eder)
+- RTSP : RPi5  → Jetson (RPi5 mediamtx, Jetson'ın RTSP sunucusunu pull eder)
+
 Gerçek zamanlı + hızlı profil:
 - TRACK_CONFIRM_MIN_HITS = 1  (ilk görüldüğü anda confirmed)
 - PUBLISH_EVERY_N_FRAMES = 3  (~10 msg/sn @30 FPS)
@@ -10,6 +18,7 @@ Exit event mantığı:
 - Track END_TTL'e düşerse "exit" olayı bir kez üretilir.
 - Exit olayı MQTT'ye publish edildikten sonra pending listeden silinir.
 - Aynı exit tekrar publish edilmez.
+- Exit'ler ayrıca highway/events/<sensor_id> topic'ine QoS=1 gönderilir.
 """
 
 import argparse
@@ -49,9 +58,16 @@ TRACKER_LIB = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracke
 TRACKER_WIDTH = 960
 TRACKER_HEIGHT = 544
 
-DEFAULT_MQTT_HOST = "localhost"
+# ── Tailscale defaultları ────────────────────────────────────────────────────
+# RPi5'in tailnet IP'si — broker burada koşuyor
+DEFAULT_MQTT_HOST = "100.84.29.29"
 DEFAULT_MQTT_PORT = 1883
-DEFAULT_SENSOR_ID = "jetson01"
+DEFAULT_SENSOR_ID = "yhnt-jetson-01"
+
+# Jetson kendi RTSP sunucusunu sadece tailnet'e açabilir.
+# "0.0.0.0" → tüm arayüzler (LAN + Tailscale + Wi-Fi)
+# "100.74.245.10" → sadece Tailscale arayüzü (önerilen, daha güvenli)
+DEFAULT_RTSP_BIND = "0.0.0.0"
 
 # Gerçek zamanlı + hızlı
 PUBLISH_EVERY_N_FRAMES = 3
@@ -70,7 +86,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Highway araç tespit pipeline'ı + MQTT telemetri",
+        description="Highway araç tespit pipeline'ı + MQTT telemetri (Tailscale ready)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", choices=["s", "n"], default="s")
@@ -79,8 +95,18 @@ def parse_args():
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--no-rtsp", action="store_true")
     parser.add_argument("--rtsp-port", type=int, default=RTSP_PORT)
+    parser.add_argument(
+        "--rtsp-bind",
+        default=DEFAULT_RTSP_BIND,
+        help="RTSP sunucusu hangi IP'ye bind olsun. "
+             "Tailscale-only erişim için '100.74.245.10' kullan.",
+    )
     parser.add_argument("--no-mqtt", action="store_true")
-    parser.add_argument("--mqtt-host", default=DEFAULT_MQTT_HOST)
+    parser.add_argument(
+        "--mqtt-host",
+        default=DEFAULT_MQTT_HOST,
+        help="Broker hostname/IP. RPi5'in tailnet IP'si veya MagicDNS adı.",
+    )
     parser.add_argument("--mqtt-port", type=int, default=DEFAULT_MQTT_PORT)
     parser.add_argument("--sensor-id", default=DEFAULT_SENSOR_ID)
     return parser.parse_args()
@@ -214,6 +240,7 @@ class Stats:
                 mstats = self._mqtt.get_stats()
                 conn = "✓" if self._mqtt.is_connected else "✗"
                 mqtt_info = (f" | MQTT {conn} pub={mstats['published']} "
+                             f"evt={mstats['events_published']} "
                              f"q={self._mqtt.queue_size} drop={mstats['dropped']}")
 
             print(
@@ -433,9 +460,14 @@ def build_pipeline(args):
     print(f"  Model:    yolo26{args.model}")
     print(f"  Tracker:  NvSORT ({tracker_config})")
     print(f"  Display:  {'kapalı' if args.no_display else 'aktif'}")
-    print(f"  RTSP:     {'kapalı' if args.no_rtsp else f'rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT}'}")
+    if args.no_rtsp:
+        print(f"  RTSP:     kapalı")
+    else:
+        rtsp_host = args.rtsp_bind if args.rtsp_bind != "0.0.0.0" else "<jetson-ip>"
+        print(f"  RTSP:     rtsp://{rtsp_host}:{args.rtsp_port}{RTSP_MOUNT}")
+        print(f"  RTSP bind: {args.rtsp_bind}")
     print(f"  MQTT:     {'kapalı' if args.no_mqtt else f'{args.mqtt_host}:{args.mqtt_port}'}")
-    print(f"  Topic:    {'-' if args.no_mqtt else f'highway/detections/{args.sensor_id}'}")
+    print(f"  Topic:    {'-' if args.no_mqtt else f'highway/telemetry/{args.sensor_id}/detections'}")
     print(f"  Publish:  her {PUBLISH_EVERY_N_FRAMES} frame (~{CAMERA_FPS // PUBLISH_EVERY_N_FRAMES} msg/sn)")
     print(f"  Confirm:  min_hits={TRACK_CONFIRM_MIN_HITS}")
     print(f"  TTL:      lost={TRACK_LOST_TTL_FRAMES} end={TRACK_END_TTL_FRAMES}")
@@ -449,9 +481,11 @@ def build_pipeline(args):
         sys.exit(1)
 
 
-def start_rtsp_server(port, mount_path, udp_port):
+def start_rtsp_server(port, mount_path, udp_port, bind_address="0.0.0.0"):
     server = GstRtspServer.RTSPServer()
     server.props.service = str(port)
+    # Sadece belirli arayüze bind — Tailscale-only senaryosu için
+    server.props.address = bind_address
 
     factory = GstRtspServer.RTSPMediaFactory()
     factory.set_launch(
@@ -525,8 +559,9 @@ def main():
     bus.connect("message", on_message, loop)
 
     if not args.no_rtsp:
-        _ = start_rtsp_server(args.rtsp_port, RTSP_MOUNT, RTSP_UDP_PORT)
-        print(f"[bilgi] RTSP sunucu hazır: rtsp://<jetson-ip>:{args.rtsp_port}{RTSP_MOUNT}")
+        _ = start_rtsp_server(args.rtsp_port, RTSP_MOUNT, RTSP_UDP_PORT, args.rtsp_bind)
+        rtsp_host = args.rtsp_bind if args.rtsp_bind != "0.0.0.0" else "<jetson-ip>"
+        print(f"[bilgi] RTSP sunucu hazır: rtsp://{rtsp_host}:{args.rtsp_port}{RTSP_MOUNT}")
 
     print("[bilgi] Engine yükleniyor...")
     pipeline.set_state(Gst.State.PLAYING)
