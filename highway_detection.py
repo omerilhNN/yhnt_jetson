@@ -25,6 +25,7 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstRtspServer", "1.0")
 from gi.repository import GLib, Gst, GstRtspServer
 
+import numpy as np
 import pyds
 from mqtt_publisher import MqttPublisher
 
@@ -65,7 +66,14 @@ TRACK_LOST_TTL_FRAMES = 45
 TRACK_END_TTL_FRAMES = 90
 TRACK_HISTORY_MAXLEN = 30
 
+# Speed estimation params
+SPEED_EMA_ALPHA = 0.35
+SPEED_MIN_DT_S = 1.0 / (CAMERA_FPS * 1.5)   # çok küçük dt jitter'ı engelle
+SPEED_MAX_KMH = 260.0                       # outlier clamp
+SPEED_MIN_MOVE_M = 0.05                     # çok küçük hareketi ignore et
+
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+HOMOGRAPHY_PATH = os.path.join(REPO_ROOT, "configs", "homography.npy")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,6 +97,33 @@ def parse_args():
     parser.add_argument("--mqtt-port", type=int, default=DEFAULT_MQTT_PORT)
     parser.add_argument("--sensor-id", default=DEFAULT_SENSOR_ID)
     return parser.parse_args()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Homography + Speed helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_homography(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Homography dosyası bulunamadı: {path}")
+    H = np.load(path)
+    if H.shape != (3, 3):
+        raise ValueError(f"Homography shape hatalı: {H.shape}, beklenen (3,3)")
+    return H.astype(np.float64)
+
+
+def pixel_to_world(H, u, v):
+    p = np.array([float(u), float(v), 1.0], dtype=np.float64)
+    w = H @ p
+    if abs(w[2]) < 1e-9:
+        return None
+    return (float(w[0] / w[2]), float(w[1] / w[2]))
+
+
+def bbox_bottom_center(rect_params):
+    u = float(rect_params.left) + float(rect_params.width) * 0.5
+    v = float(rect_params.top) + float(rect_params.height)
+    return u, v
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,7 +317,43 @@ class Stats:
 # Probe
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
+def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False, homography=None):
+    # tid -> speed state
+    speed_state = {}
+
+    def _estimate_speed_kmh(track_id, world_xy, ts_sec):
+        st = speed_state.get(track_id)
+        if st is None:
+            speed_state[track_id] = {
+                "last_world": world_xy,
+                "last_ts": ts_sec,
+                "speed_ema_kmh": 0.0,
+            }
+            return 0.0, 0.0  # raw, ema
+
+        dt = ts_sec - st["last_ts"]
+        if dt < SPEED_MIN_DT_S:
+            return st["speed_ema_kmh"], st["speed_ema_kmh"]
+
+        dx = world_xy[0] - st["last_world"][0]
+        dy = world_xy[1] - st["last_world"][1]
+        dist_m = (dx * dx + dy * dy) ** 0.5
+
+        if dist_m < SPEED_MIN_MOVE_M:
+            raw_kmh = 0.0
+        else:
+            raw_kmh = (dist_m / dt) * 3.6
+
+        if raw_kmh > SPEED_MAX_KMH:
+            raw_kmh = SPEED_MAX_KMH
+
+        ema = SPEED_EMA_ALPHA * raw_kmh + (1.0 - SPEED_EMA_ALPHA) * st["speed_ema_kmh"]
+
+        st["last_world"] = world_xy
+        st["last_ts"] = ts_sec
+        st["speed_ema_kmh"] = ema
+        return raw_kmh, ema
+
     def probe(pad, info, u_data):
         gst_buffer = info.get_buffer()
         if not gst_buffer:
@@ -304,6 +375,13 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
             mqtt_detections = []   # active object candidates
             debug_lines = []
 
+            # timestamp: PTS varsa onu kullan, yoksa fallback wall clock
+            ts_sec = 0.0
+            if hasattr(frame_meta, "buf_pts") and frame_meta.buf_pts and int(frame_meta.buf_pts) > 0:
+                ts_sec = float(frame_meta.buf_pts) / 1e9
+            else:
+                ts_sec = time.time()
+
             l_obj = frame_meta.obj_meta_list
             while l_obj is not None:
                 try:
@@ -319,17 +397,33 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False):
                 if track_id != TRACK_ID_UNASSIGNED:
                     track_id_class_pairs.append((track_id, cls_id))
                     r = obj_meta.rect_params
+
+                    speed_kmh = 0.0
+                    if homography is not None:
+                        u, v = bbox_bottom_center(r)
+                        world_xy = pixel_to_world(homography, u, v)
+                        if world_xy is not None:
+                            _, speed_ema = _estimate_speed_kmh(int(track_id), world_xy, ts_sec)
+                            speed_kmh = max(0.0, float(speed_ema))
+
+                    # OSD label: ID yanında hız
+                    obj_meta.text_params.display_text = (
+                        f"{cls_name}[id={int(track_id)}] {speed_kmh:.1f} km/h"
+                    )
+
                     mqtt_detections.append({
                         "track_id": int(track_id),
                         "class": cls_name,
                         "confidence": round(float(obj_meta.confidence), 2),
                         "bbox": [int(r.left), int(r.top), int(r.width), int(r.height)],
                         "track_state": "active",
+                        "speed_kmh": round(speed_kmh, 1),
                     })
 
                     if debug:
                         debug_lines.append(
-                            f"{cls_name}[id={track_id}] conf={obj_meta.confidence:.2f} "
+                            f"{cls_name}[id={track_id}] speed={speed_kmh:.1f}km/h "
+                            f"conf={obj_meta.confidence:.2f} "
                             f"bbox=({int(r.left)},{int(r.top)},{int(r.width)},{int(r.height)})"
                         )
 
@@ -522,6 +616,14 @@ def main():
     args = parse_args()
     Gst.init(None)
 
+    # Homography yükle
+    try:
+        H = load_homography(HOMOGRAPHY_PATH)
+        print(f"[bilgi] Homography yüklendi: {HOMOGRAPHY_PATH}")
+    except Exception as e:
+        print(f"[HATA] Homography yüklenemedi: {e}")
+        sys.exit(1)
+
     mqtt_publisher = None
     if not args.no_mqtt:
         mqtt_publisher = MqttPublisher(
@@ -544,7 +646,12 @@ def main():
         print("HATA: osd sink pad alınamadı")
         sys.exit(1)
 
-    probe_fn = make_osd_sink_pad_probe(stats, mqtt_publisher=mqtt_publisher, debug=args.debug)
+    probe_fn = make_osd_sink_pad_probe(
+        stats,
+        mqtt_publisher=mqtt_publisher,
+        debug=args.debug,
+        homography=H,
+    )
     osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, probe_fn, 0)
 
     loop = GLib.MainLoop()
