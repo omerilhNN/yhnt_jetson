@@ -33,7 +33,7 @@ from mqtt_publisher import MqttPublisher
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-CAMERA_DEVICE = "/dev/video0"
+CAMERA_DEVICE = "/dev/v4l/by-id/usb-Arducam_Arducam_B0495__USB3_2.3MP__Arducam_202500915_0001-video-index0"
 CAMERA_WIDTH = 1920
 CAMERA_HEIGHT = 1200
 CAMERA_FPS = 30
@@ -59,7 +59,8 @@ DEFAULT_RTSP_BIND = "0.0.0.0"
 PUBLISH_EVERY_N_FRAMES = 3
 TRACK_ID_UNASSIGNED = 0xFFFFFFFFFFFFFFFF
 
-CLASS_NAMES = ["others", "car", "van", "bus"]
+# Yeni 5-class model mapping
+CLASS_NAMES = ["car", "van", "bus", "motorcycle", "truck"]
 
 TRACK_CONFIRM_MIN_HITS = 1
 TRACK_LOST_TTL_FRAMES = 45
