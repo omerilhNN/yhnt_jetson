@@ -540,19 +540,21 @@ def build_pipeline(args):
     """
 
     display_branch = """
-        t. ! queue leaky=downstream max-size-buffers=4 max-size-time=0 max-size-bytes=0 !
+        t. ! queue leaky=downstream max-size-buffers=8 max-size-time=0 max-size-bytes=0 !
         videoconvert !
         autovideosink sync=false
     """ if not args.no_display else ""
 
     rtsp_branch = f"""
-        t. ! queue leaky=downstream max-size-buffers=4 max-size-time=0 max-size-bytes=0 !
+        t. ! queue leaky=downstream max-size-buffers=8 max-size-time=0 max-size-bytes=0 !
         videoconvert !
         video/x-raw,format=I420 !
-        x264enc bitrate={ENCODER_BITRATE_KBPS} tune=zerolatency speed-preset=ultrafast key-int-max=30 !
+        x264enc bitrate={ENCODER_BITRATE_KBPS} tune=zerolatency speed-preset=ultrafast
+                threads=2 key-int-max=60 b-adapt=false bframes=0
+                option-string="no-mbtree:sliced-threads:rc-lookahead=0" !
         h264parse !
         rtph264pay config-interval=1 pt=96 !
-        udpsink host=127.0.0.1 port={RTSP_UDP_PORT} sync=false async=false
+        udpsink host=127.0.0.1 port={RTSP_UDP_PORT} sync=false async=false buffer-size=2097152
     """ if not args.no_rtsp else ""
 
     pipeline_str = common + display_branch + rtsp_branch
@@ -598,7 +600,7 @@ def start_rtsp_server(port, mount_path, udp_port, bind_address="0.0.0.0"):
 
     factory = GstRtspServer.RTSPMediaFactory()
     factory.set_launch(
-        f'( udpsrc name=pay0 port={udp_port} buffer-size=524288 '
+        f'( udpsrc name=pay0 port={udp_port} buffer-size=2097152 '
         f'caps="application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96" )'
     )
     factory.set_shared(True)
