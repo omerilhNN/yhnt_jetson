@@ -28,6 +28,7 @@ from gi.repository import GLib, Gst, GstRtspServer
 import numpy as np
 import pyds
 from mqtt_publisher import MqttPublisher
+from anomaly_detector import AnomalyDetector, AnomalyConfig, TrackInfo
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -97,6 +98,8 @@ def parse_args():
     parser.add_argument("--mqtt-host", default=DEFAULT_MQTT_HOST)
     parser.add_argument("--mqtt-port", type=int, default=DEFAULT_MQTT_PORT)
     parser.add_argument("--sensor-id", default=DEFAULT_SENSOR_ID)
+    parser.add_argument("--no-anomaly", action="store_true",
+                        help="Anomali tespitini devre dışı bırak")
     return parser.parse_args()
 
 
@@ -318,7 +321,7 @@ class Stats:
 # Probe
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False, homography=None):
+def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False, homography=None, anomaly_detector=None):
     # tid -> speed state
     speed_state = {}
 
@@ -473,6 +476,40 @@ def make_osd_sink_pad_probe(stats, mqtt_publisher=None, debug=False, homography=
                     detections=active_only,
                     event_objects=event_objects,
                 )
+
+            # ── Anomaly detection ──
+            if anomaly_detector is not None:
+                track_infos = []
+                for d in mqtt_detections:
+                    tid = d["track_id"]
+                    ss = speed_state.get(tid)
+                    if ss is not None:
+                        track_infos.append(TrackInfo(
+                            track_id=tid,
+                            class_name=d["class"],
+                            speed_kmh=d["speed_kmh"],
+                            world_x=ss["last_world"][0],
+                            world_y=ss["last_world"][1],
+                            bbox=d["bbox"],
+                        ))
+                anomalies = anomaly_detector.update(
+                    frame_id=int(frame_meta.frame_num),
+                    timestamp=ts_sec,
+                    tracks=track_infos,
+                )
+                if anomalies:
+                    if mqtt_publisher is not None:
+                        mqtt_publisher.publish_anomalies(
+                            frame_id=int(frame_meta.frame_num),
+                            anomalies=[a.to_dict() for a in anomalies],
+                        )
+                    if debug:
+                        for a in anomalies:
+                            print(f"  ⚠ ANOMALY: {a.anomaly_type.value} "
+                                  f"severity={a.severity.value} "
+                                  f"track={a.track_id} "
+                                  f"dur={a.duration_sec:.1f}s "
+                                  f"msg={a.message}")
 
             if debug and debug_lines:
                 print(f"  └─ frame#{frame_meta.frame_num}: " + ", ".join(debug_lines))
@@ -636,6 +673,18 @@ def main():
         )
         mqtt_publisher.start()
 
+    # Anomaly detector
+    anomaly_det = None
+    if not args.no_anomaly:
+        anomaly_det = AnomalyDetector(
+            config=AnomalyConfig(),
+            sensor_id=args.sensor_id,
+        )
+        print(f"[bilgi] Anomaly detection aktif")
+        print(f"  Topic(anomaly): highway/anomalies/{args.sensor_id}/detections")
+    else:
+        print(f"[bilgi] Anomaly detection devre dışı (--no-anomaly)")
+
     pipeline = build_pipeline(args)
     stats = Stats(mqtt_publisher=mqtt_publisher)
 
@@ -654,6 +703,7 @@ def main():
         mqtt_publisher=mqtt_publisher,
         debug=args.debug,
         homography=H,
+        anomaly_detector=anomaly_det,
     )
     osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, probe_fn, 0)
 

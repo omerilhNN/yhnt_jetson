@@ -47,6 +47,8 @@ class MqttPublisher:
         self.cmd_request_topic = f"highway/commands/{sensor_id}/request"
         self.cmd_response_topic = f"highway/commands/{sensor_id}/response"
 
+        self.anomaly_topic = f"highway/anomalies/{sensor_id}/detections"
+
         # Queue
         self._queue: deque = deque(maxlen=max_queue_size)
         self._queue_lock = threading.Lock()
@@ -189,7 +191,7 @@ class MqttPublisher:
         interval_ok = (now - self._last_det_publish_ts) >= self._min_publish_interval
         changed = (sig != self._last_det_signature)
 
-        if (not has_events) and ((not interval_ok) or (not changed)):
+        if (not has_events) and ((not interval_ok) and (not changed)):
             return
 
         telemetry_payload = {
@@ -242,6 +244,7 @@ class MqttPublisher:
             "capabilities": {
                 "detections": True,
                 "events_enter_exit": True,
+                "anomalies": True,
                 "commands": True,
                 "stats": True,
                 "heartbeat": True,
@@ -253,6 +256,24 @@ class MqttPublisher:
             "_retain": True,
             "_payload": payload,
         })
+
+    def publish_anomalies(self, frame_id: int, anomalies: list[dict]):
+        """Anomali event'lerini QoS1 ile yayınla."""
+        if not anomalies:
+            return
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "sensor_id": self.sensor_id,
+            "ts_utc": _utcnow_iso(),
+            "frame_id": frame_id,
+            "anomalies": anomalies,
+        }
+        self._enqueue({
+            "_topic": self.anomaly_topic,
+            "_qos": 1,
+            "_payload": payload,
+        })
+        self._stats["events_published"] += len(anomalies)
 
     @property
     def is_connected(self) -> bool:
