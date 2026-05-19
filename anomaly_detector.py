@@ -97,11 +97,17 @@ class AnomalyConfig:
     wrong_way_duration_sec: float = 2.0
     wrong_way_angle_threshold_deg: float = 135.0
 
-    # Allowed traffic direction in world coordinates (unit vector).
-    # Default: +Y yönü (kameraya uzaklaşan trafik).
-    # calibrate_homography.py'deki P1→P4 yönüne uygun.
-    allowed_direction_x: float = 0.0
-    allowed_direction_y: float = 1.0
+    # Direction learning: sistem başlangıcında ilk N aracın hareket yönünü
+    # gözlemleyerek geçerli trafik akış yönünü öğrenir.
+    # Öğrenme tamamlanana kadar WRONG_WAY anomalisi üretilmez.
+    direction_learning_vehicle_count: int = 10
+    # Bir aracın yön oyu sayılabilmesi için gerekli minimum hareket (metre)
+    direction_learning_min_displacement_m: float = 2.0
+
+    # Fallback: öğrenme başarısız olursa veya devre dışıysa kullanılacak yön.
+    # Default: +Y yönü (kameradan uzaklaşan trafik, homography P1→P4 yönü).
+    fallback_direction_x: float = 0.0
+    fallback_direction_y: float = 1.0
 
     # Lane violation
     # Her poligon: list of (world_x, world_y) tuples.
@@ -218,15 +224,24 @@ class AnomalyDetector:
         # cooldown: (track_id_or_frozenset, AnomalyType) -> last fire timestamp
         self._cooldowns: dict[tuple, float] = {}
 
-        # Precompute allowed direction unit vector
-        mag = math.hypot(self.cfg.allowed_direction_x, self.cfg.allowed_direction_y)
-        if mag < 1e-9:
-            self._allowed_dir = (0.0, 1.0)
-        else:
-            self._allowed_dir = (
-                self.cfg.allowed_direction_x / mag,
-                self.cfg.allowed_direction_y / mag,
-            )
+        # ── Direction learning state ──
+        # İlk N aracın hareket yönünü gözlemleyerek trafik akış yönünü öğren.
+        # Öğrenme tamamlanana kadar _learned_dir = None → WRONG_WAY üretilmez.
+        self._direction_learned: bool = False
+        self._learned_dir: tuple[float, float] | None = None
+
+        # Oy veren track'ler: track_id -> (direction_x, direction_y) unit vector
+        # Bir track yeterli displacement'a ulaşınca tek bir oy kullanır.
+        self._direction_votes: dict[int, tuple[float, float]] = {}
+        # Oy vermiş track id'leri (birden fazla oy engelleme)
+        self._direction_voted_tids: set[int] = set()
+        # Track başına ilk gözlem noktası (öğrenme fazı için)
+        self._direction_first_pos: dict[int, tuple[float, float]] = {}
+
+        # Öğrenme devre dışıysa (vehicle_count <= 0) fallback kullan
+        if self.cfg.direction_learning_vehicle_count <= 0:
+            self._apply_fallback_direction()
+            print(f"[anomaly] Direction learning devre dışı, fallback yön kullanılıyor: {self._learned_dir}")
 
     # ──────────────────────────────────────────────────────────────────────
     # Public API
@@ -274,7 +289,11 @@ class AnomalyDetector:
         # 2) Stale track'leri temizle
         self._prune_stale_tracks(timestamp, active_tids)
 
-        # 3) Anomali kurallarını çalıştır
+        # 3) Direction learning (henüz öğrenilmediyse)
+        if not self._direction_learned:
+            self._direction_learning_update(tracks)
+
+        # 4) Anomali kurallarını çalıştır
         anomalies: list[AnomalyEvent] = []
 
         stopped_tids = self._detect_stopped_vehicles(frame_id, timestamp, anomalies)
@@ -285,7 +304,7 @@ class AnomalyDetector:
         self._detect_overspeed(frame_id, timestamp, anomalies)
         self._detect_underspeed(frame_id, timestamp, anomalies)
 
-        # 4) Stale cooldown'ları temizle (periyodik)
+        # 5) Stale cooldown'ları temizle (periyodik)
         if frame_id % 300 == 0:
             self._prune_cooldowns(timestamp)
 
@@ -365,7 +384,15 @@ class AnomalyDetector:
         timestamp: float,
         out: list[AnomalyEvent],
     ):
-        """Ters yön tespiti: hareket vektörü ile izin verilen yön arasındaki açı."""
+        """
+        Ters yön tespiti.
+        Öğrenme fazı tamamlanmadan çalışmaz — false positive önleme.
+        Öğrenilen trafik yönü ile hareket vektörü karşılaştırılır.
+        """
+        # Yön henüz öğrenilmediyse WRONG_WAY üretme
+        if not self._direction_learned or self._learned_dir is None:
+            return
+
         cfg = self.cfg
 
         for tid, history in self._history.items():
@@ -752,6 +779,135 @@ class AnomalyDetector:
             ))
 
     # ──────────────────────────────────────────────────────────────────────
+    # Direction learning
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _direction_learning_update(self, tracks: list[TrackInfo]):
+        """
+        Öğrenme fazı: her track'in ilk ve güncel pozisyonundan hareket vektörü çıkar.
+        Yeterli displacement'a ulaşan track'ler oy kullanır.
+        Yeterli oy toplandığında çoğunluk yönü trafik akış yönü olarak belirlenir.
+        """
+        if self._direction_learned:
+            return
+
+        cfg = self.cfg
+        min_disp = cfg.direction_learning_min_displacement_m
+
+        for t in tracks:
+            tid = t.track_id
+
+            # Çok yavaş araçlar güvenilir yön vermez
+            if t.speed_kmh < cfg.stopped_speed_threshold_kmh * 2:
+                continue
+
+            # İlk pozisyon kaydı
+            if tid not in self._direction_first_pos:
+                self._direction_first_pos[tid] = (t.world_x, t.world_y)
+                continue
+
+            # Zaten oy vermiş
+            if tid in self._direction_voted_tids:
+                continue
+
+            # Displacement hesapla
+            fx, fy = self._direction_first_pos[tid]
+            dx = t.world_x - fx
+            dy = t.world_y - fy
+            disp = math.hypot(dx, dy)
+
+            if disp < min_disp:
+                continue
+
+            # Birim vektör olarak oy kaydet
+            dir_x = dx / disp
+            dir_y = dy / disp
+            self._direction_votes[tid] = (dir_x, dir_y)
+            self._direction_voted_tids.add(tid)
+
+            print(
+                f"[anomaly] Direction vote #{len(self._direction_votes)}/"
+                f"{cfg.direction_learning_vehicle_count}: "
+                f"track_id={tid} yön=({dir_x:.2f}, {dir_y:.2f}) "
+                f"displacement={disp:.1f}m"
+            )
+
+            # Yeterli oy toplandı mı?
+            if len(self._direction_votes) >= cfg.direction_learning_vehicle_count:
+                self._finalize_direction_learning()
+                return
+
+    def _finalize_direction_learning(self):
+        """Toplanan oylardan çoğunluk yönünü hesapla ve öğrenmeyi tamamla."""
+        votes = list(self._direction_votes.values())
+
+        if not votes:
+            self._apply_fallback_direction()
+            return
+
+        # Tüm oy vektörlerini topla (ortalama yön)
+        sum_x = sum(v[0] for v in votes)
+        sum_y = sum(v[1] for v in votes)
+        mag = math.hypot(sum_x, sum_y)
+
+        if mag < 1e-9:
+            # Oylar birbirini nötralize etti — çift yönlü yol?
+            # Fallback kullan
+            print("[anomaly] Yön oyları nötralize oldu — fallback yön kullanılıyor")
+            self._apply_fallback_direction()
+            return
+
+        learned_x = sum_x / mag
+        learned_y = sum_y / mag
+
+        self._learned_dir = (learned_x, learned_y)
+        self._direction_learned = True
+
+        # Yön açısını insanlar için okunur hale getir
+        angle_deg = math.degrees(math.atan2(learned_y, learned_x))
+
+        # Oy dağılımını hesapla: kaç tanesi öğrenilen yöne uyumlu?
+        threshold_cos = math.cos(math.radians(90))  # ±90° tolerans
+        aligned = sum(
+            1 for vx, vy in votes
+            if (vx * learned_x + vy * learned_y) > threshold_cos
+        )
+
+        print(
+            f"[anomaly] ═══ Trafik yönü öğrenildi ═══\n"
+            f"  Yön vektörü: ({learned_x:.3f}, {learned_y:.3f})\n"
+            f"  Açı: {angle_deg:.1f}°\n"
+            f"  Uyumlu oy: {aligned}/{len(votes)}\n"
+            f"  Wrong-way tespiti artık aktif."
+        )
+
+        # Öğrenme fazı state'ini temizle (bellek tasarrufu)
+        self._direction_votes.clear()
+        self._direction_voted_tids.clear()
+        self._direction_first_pos.clear()
+
+    def _apply_fallback_direction(self):
+        """Fallback yönü uygula ve öğrenmeyi tamamlanmış say."""
+        fx = self.cfg.fallback_direction_x
+        fy = self.cfg.fallback_direction_y
+        mag = math.hypot(fx, fy)
+        if mag < 1e-9:
+            self._learned_dir = (0.0, 1.0)
+        else:
+            self._learned_dir = (fx / mag, fy / mag)
+        self._direction_learned = True
+
+    @property
+    def direction_learned(self) -> bool:
+        """Trafik yönü öğrenildi mi?"""
+        return self._direction_learned
+
+    @property
+    def learned_direction(self) -> tuple[float, float] | None:
+        """Öğrenilen trafik yön vektörü (birim vektör). None ise henüz öğrenilmedi."""
+        return self._learned_dir
+
+    # ──────────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────────
 
@@ -786,11 +942,15 @@ class AnomalyDetector:
         """
         Geçmişteki kesintisiz ters yön başlangıcını bul.
         Ardışık sample çiftlerinden hareket vektörü hesaplar.
+        Öğrenilen trafik yönünü referans alır.
         """
+        if self._learned_dir is None:
+            return None
+
         threshold_cos = math.cos(
             math.radians(self.cfg.wrong_way_angle_threshold_deg)
         )
-        ax, ay = self._allowed_dir
+        ax, ay = self._learned_dir
         wrong_start = None
 
         samples = list(history)
