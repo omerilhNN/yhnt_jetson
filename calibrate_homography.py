@@ -1,15 +1,36 @@
 #!/usr/bin/env python3
 """
-Canli kameradan tek frame yakala, 4 nokta tikla, parametreleri GUI'den gir,
-configs/homography.npy uret.
+Homografi Kalibrasyon Araci — Tek Serit, 4 Nokta
+
+Kameradan tek frame yakalar, kullanicidan 4 nokta alir,
+serit genisligi ve periyot parametrelerini GUI'den sorar,
+configs/homography.npy uretir.
+
+Referans noktasi secimi:
+  Tek seridin (tercihen orta serit) iki ardisik kesik cizgi baslangiclarinin
+  sol ve sag kenarlari. Orta serit lens distorsiyonunun en az oldugu bolgedir.
+
+Tiklama sirasi (saat yonunde):
+  P1 = yakin sol   (sana en yakin kesik cizginin sol kenari)
+  P2 = yakin sag   (sana en yakin kesik cizginin sag kenari)
+  P3 = uzak sag    (bir sonraki kesik cizginin sag kenari)
+  P4 = uzak sol    (bir sonraki kesik cizginin sol kenari)
+
+        Yol goruntusu:              Dunya koordinatlari:
+     P4 ──────── P3                P4 ──────── P3
+      \\          /                 |            |
+       \\        /                  | periyot(m) |
+        \\      /                   |            |
+     P1 ──── P2                   P1 ──────── P2
+     (yakin, genis)                 genislik(m)
 
 Kullanim:
     python3 calibrate_homography.py
-
-Sahnede 4 referans noktasi: bir seridin iki ardisik kesik cizgi
-baslangiclarinin sol/sag kenarlari.
+    python3 calibrate_homography.py --device /dev/video0
+    python3 calibrate_homography.py --image frame.jpg
 """
 
+import argparse
 import os
 import sys
 
@@ -21,9 +42,11 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
 
-# ─── Sabitler ───
+# ─── Sabitler ───────────────────────────────────────────────────────────────
+
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_PATH = os.path.join(REPO_ROOT, "configs", "homography.npy")
+OUTPUT_DIR = os.path.join(REPO_ROOT, "configs")
+OUTPUT_PATH = os.path.join(OUTPUT_DIR, "homography.npy")
 
 CAMERA_DEVICE = "/dev/video0"
 CAMERA_WIDTH = 1920
@@ -32,16 +55,50 @@ CAMERA_FPS = 30
 
 WARMUP_FRAMES = 30
 
-DEFAULT_LANE_WIDTH_M = 3.75
-DEFAULT_LANE_PERIOD_M = 18.0
+DEFAULT_LANE_WIDTH_M = 3.75   # Otoyol standart serit genisligi
+DEFAULT_LANE_PERIOD_M = 18.0  # Otoyol kesik cizgi periyodu (9m cizgi + 9m bosluk)
+
+# Reprojection hata esigi (metre): bunun uzerindeyse uyari ver
+REPROJECTION_WARN_THRESHOLD_M = 0.10
+
+# Kondisyon sayisi esigi: bunun uzerindeyse matris sayisal olarak guvenilmez
+CONDITION_NUMBER_WARN = 1e6
 
 
-# ─── Frame yakalama ───
-def grab_frame_from_camera() -> np.ndarray:
+# ─── CLI ────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Homografi kalibrasyon araci — tek serit, 4 nokta",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--device", default=CAMERA_DEVICE,
+        help="V4L2 kamera cihazi",
+    )
+    parser.add_argument(
+        "--image", default=None,
+        help="Kamera yerine mevcut bir goruntu dosyasi kullan (.jpg/.png)",
+    )
+    parser.add_argument(
+        "--width", type=float, default=DEFAULT_LANE_WIDTH_M,
+        help="Varsayilan serit genisligi (m)",
+    )
+    parser.add_argument(
+        "--period", type=float, default=DEFAULT_LANE_PERIOD_M,
+        help="Varsayilan periyot (m)",
+    )
+    return parser.parse_args()
+
+
+# ─── Frame yakalama ─────────────────────────────────────────────────────────
+
+def grab_frame_from_camera(device: str) -> np.ndarray:
+    """GStreamer ile kameradan tek frame yakala (warmup sonrasi)."""
     Gst.init(None)
 
     pipeline_str = (
-        f"v4l2src device={CAMERA_DEVICE} num-buffers={WARMUP_FRAMES + 5} ! "
+        f"v4l2src device={device} num-buffers={WARMUP_FRAMES + 5} ! "
         f"video/x-raw,format=YUY2,width={CAMERA_WIDTH},height={CAMERA_HEIGHT},"
         f"framerate={CAMERA_FPS}/1 ! "
         f"videoconvert ! "
@@ -89,14 +146,144 @@ def grab_frame_from_camera() -> np.ndarray:
     return last_frame
 
 
-# ─── 4 nokta tiklama ───
+def load_frame_from_file(path: str) -> np.ndarray:
+    """Dosyadan frame yukle."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Goruntu dosyasi bulunamadi: {path}")
+    frame = cv2.imread(path)
+    if frame is None:
+        raise RuntimeError(f"Goruntu okunamadi: {path}")
+    return frame
+
+
+# ─── Geometri dogrulama ─────────────────────────────────────────────────────
+
+def polygon_area_signed(pts):
+    """Shoelace formuluyle isaret alan hesapla. Pozitif = saat yonunun tersi."""
+    n = len(pts)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += pts[i][0] * pts[j][1]
+        area -= pts[j][0] * pts[i][1]
+    return area / 2.0
+
+
+def is_convex_quadrilateral(pts):
+    """4 noktanin konveks dortgen olusturup olusturamadigini kontrol et."""
+    n = len(pts)
+    if n != 4:
+        return False
+
+    signs = []
+    for i in range(n):
+        p0 = pts[i]
+        p1 = pts[(i + 1) % n]
+        p2 = pts[(i + 2) % n]
+        cross = (p1[0] - p0[0]) * (p2[1] - p1[1]) - (p1[1] - p0[1]) * (p2[0] - p1[0])
+        signs.append(cross)
+
+    # Tum cross product'lar ayni isarette olmali
+    all_pos = all(s > 0 for s in signs)
+    all_neg = all(s < 0 for s in signs)
+    return all_pos or all_neg
+
+
+def validate_point_order(pts):
+    """
+    Nokta sirasini dogrula:
+    - 4 nokta konveks dortgen olusturmali
+    - P1-P2 (yakin kenar) P3-P4'ten (uzak kenar) genis olmali (perspektif)
+    - Saat yonunde siralanmali
+
+    Dondurulen: (gecerli_mi, hata_mesaji_veya_None)
+    """
+    if len(pts) != 4:
+        return False, "Tam 4 nokta gerekli"
+
+    if not is_convex_quadrilateral(pts):
+        return False, (
+            "Noktalar konveks dortgen olusturmuyor.\n"
+            "Capraz tiklama yapmis olabilirsin. Sira: P1(yakin sol) -> P2(yakin sag) -> P3(uzak sag) -> P4(uzak sol)"
+        )
+
+    # Saat yonu kontrolu (signed area negatif = saat yonu, goruntu koordinatlarinda y asagi)
+    area = polygon_area_signed(pts)
+    if area > 0:
+        return False, (
+            "Noktalar saat yonunun tersinde siralanmis.\n"
+            "Dogru sira: P1(yakin sol) -> P2(yakin sag) -> P3(uzak sag) -> P4(uzak sol)"
+        )
+
+    # Perspektif kontrolu: yakin kenar (P1-P2) uzak kenardan (P3-P4) genis olmali
+    dist_near = np.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+    dist_far = np.hypot(pts[2][0] - pts[3][0], pts[2][1] - pts[3][1])
+    if dist_far > dist_near * 1.1:  # %10 tolerans
+        return False, (
+            f"Uzak kenar ({dist_far:.0f}px) yakin kenardan ({dist_near:.0f}px) genis.\n"
+            "P1-P2 sana yakin (genis), P3-P4 uzak (dar) olmali."
+        )
+
+    # P1-P2 yaklasik yatay olmali
+    angle_near = abs(np.degrees(np.arctan2(
+        pts[1][1] - pts[0][1], pts[1][0] - pts[0][0]
+    )))
+    if angle_near > 30:
+        return False, (
+            f"P1-P2 cizgisi yataydan {angle_near:.1f}° sapiyor.\n"
+            "Yakin kenarin iki ucunu yatay olarak tikla."
+        )
+
+    return True, None
+
+
+# ─── 4 nokta tiklama ────────────────────────────────────────────────────────
+
 clicked_points: list[tuple[int, int]] = []
 click_image: np.ndarray | None = None
-click_window = "Tikla: P1 (yakin sol) -> P2 (yakin sag) -> P3 (uzak sag) -> P4 (uzak sol)  |  R=sifirla, ESC=cik"
+click_original: np.ndarray | None = None
+CLICK_WINDOW = "P1(yakin sol) > P2(yakin sag) > P3(uzak sag) > P4(uzak sol)  |  R=sifirla  Z=geri  ESC=cik"
+
+POINT_LABELS = ["P1 yakin sol", "P2 yakin sag", "P3 uzak sag", "P4 uzak sol"]
+POINT_COLORS = [(0, 255, 0), (0, 200, 255), (255, 100, 0), (255, 0, 200)]
+
+
+def _redraw_points():
+    """Mevcut noktalari click_image uzerine yeniden ciz."""
+    global click_image
+    click_image = click_original.copy()
+
+    for i, (x, y) in enumerate(clicked_points):
+        color = POINT_COLORS[i]
+        cv2.circle(click_image, (x, y), 8, color, -1)
+        cv2.circle(click_image, (x, y), 12, color, 2)
+        cv2.putText(click_image, f"P{i+1}", (x + 14, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+    # Cizgileri ciz
+    if len(clicked_points) >= 2:
+        # P1-P2 (yakin kenar, kirmizi)
+        cv2.line(click_image, clicked_points[0], clicked_points[1], (0, 0, 255), 2)
+    if len(clicked_points) >= 3:
+        # P2-P3 (sag kenar)
+        cv2.line(click_image, clicked_points[1], clicked_points[2], (200, 200, 0), 2)
+    if len(clicked_points) >= 4:
+        # P3-P4 (uzak kenar, kirmizi)
+        cv2.line(click_image, clicked_points[2], clicked_points[3], (0, 0, 255), 2)
+        # P4-P1 (sol kenar)
+        cv2.line(click_image, clicked_points[3], clicked_points[0], (200, 200, 0), 2)
+
+    # Sonraki nokta ipucu
+    if len(clicked_points) < 4:
+        hint = f"Siradaki: {POINT_LABELS[len(clicked_points)]}"
+        cv2.putText(click_image, hint, (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+    cv2.imshow(CLICK_WINDOW, click_image)
 
 
 def on_mouse(event, x, y, flags, param):
-    global clicked_points, click_image
+    global clicked_points
 
     if event != cv2.EVENT_LBUTTONDOWN:
         return
@@ -104,71 +291,104 @@ def on_mouse(event, x, y, flags, param):
         return
 
     clicked_points.append((x, y))
-    label = f"P{len(clicked_points)}"
-    cv2.circle(click_image, (x, y), 6, (0, 255, 0), -1)
-    cv2.putText(click_image, label, (x + 10, y - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    idx = len(clicked_points)
+    print(f"  [P{idx}] piksel = ({x}, {y})  — {POINT_LABELS[idx-1]}")
 
-    # P1->P2->P3->P4 cizgilerini de ciz, kullaniciya goster
-    if len(clicked_points) >= 2:
-        for i in range(len(clicked_points) - 1):
-            cv2.line(click_image, clicked_points[i], clicked_points[i + 1],
-                     (0, 200, 0), 2)
+    _redraw_points()
+
+    # 4 nokta tamam, hemen dogrula
     if len(clicked_points) == 4:
-        cv2.line(click_image, clicked_points[3], clicked_points[0],
-                 (0, 200, 0), 2)
-
-    cv2.imshow(click_window, click_image)
-    print(f"[{label}] piksel = ({x}, {y})")
+        ok, err = validate_point_order(clicked_points)
+        if not ok:
+            print(f"\n  [!] {err}")
+            print("  [bilgi] R ile sifirla ve tekrar dene.\n")
+            # Goruntude de uyariyi goster
+            cv2.putText(click_image, "HATA: " + err.split("\n")[0],
+                        (20, click_image.shape[0] - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.imshow(CLICK_WINDOW, click_image)
 
 
 def collect_4_points(frame: np.ndarray) -> list[tuple[int, int]] | None:
-    global clicked_points, click_image
+    """Kullanicidan 4 nokta al. Dogrulama gecene kadar tekrar ettir."""
+    global clicked_points, click_image, click_original
 
     clicked_points = []
+    click_original = frame.copy()
     click_image = frame.copy()
 
-    cv2.namedWindow(click_window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(click_window, 1280, 800)
-    cv2.imshow(click_window, click_image)
-    cv2.setMouseCallback(click_window, on_mouse)
+    cv2.namedWindow(CLICK_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(CLICK_WINDOW, 1280, 800)
+
+    # Baslangic ipucu
+    cv2.putText(click_image, f"Siradaki: {POINT_LABELS[0]}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    cv2.imshow(CLICK_WINDOW, click_image)
+    cv2.setMouseCallback(CLICK_WINDOW, on_mouse)
 
     while True:
         key = cv2.waitKey(20) & 0xFF
+
         if key == 27:  # ESC
-            cv2.destroyWindow(click_window)
+            cv2.destroyWindow(CLICK_WINDOW)
             return None
+
+        # R = tamamen sifirla
         if key in (ord("r"), ord("R")):
             clicked_points = []
-            click_image = frame.copy()
-            cv2.imshow(click_window, click_image)
-            print("[bilgi] Sifirlandi.")
+            _redraw_points()
+            print("  [bilgi] Tum noktalar sifirlandi.")
             continue
-        if len(clicked_points) == 4:
-            break
 
-    cv2.destroyWindow(click_window)
+        # Z = son noktayi geri al
+        if key in (ord("z"), ord("Z")) and clicked_points:
+            removed = clicked_points.pop()
+            _redraw_points()
+            print(f"  [bilgi] Son nokta geri alindi: {removed}")
+            continue
+
+        # 4 nokta tiklandi ve gecerli mi?
+        if len(clicked_points) == 4:
+            ok, _ = validate_point_order(clicked_points)
+            if ok:
+                # Enter ile onayla veya otomatik gecis
+                if key in (13, 10, 32):  # Enter veya Space
+                    break
+                # 4 nokta gecerli, ekranda "Enter ile onayla" goster
+                temp = click_image.copy()
+                cv2.putText(temp, "OK — Enter veya Space ile onayla",
+                            (20, frame.shape[0] - 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.imshow(CLICK_WINDOW, temp)
+
+    cv2.destroyWindow(CLICK_WINDOW)
+    cv2.waitKey(1)
     return list(clicked_points)
 
 
-# ─── GUI input dialog ───
-def prompt_params_gui(frame: np.ndarray,
-                      points: list[tuple[int, int]],
-                      defaults: tuple[float, float] = (DEFAULT_LANE_WIDTH_M, DEFAULT_LANE_PERIOD_M)
-                      ) -> tuple[float, float] | None:
+# ─── GUI parametre girisi ───────────────────────────────────────────────────
+
+def prompt_params_gui(
+    frame: np.ndarray,
+    points: list[tuple[int, int]],
+    defaults: tuple[float, float] = (DEFAULT_LANE_WIDTH_M, DEFAULT_LANE_PERIOD_M),
+) -> tuple[float, float] | None:
     """
-    Frame uzerinde tiklanmis 4 noktayi gosterirken, yari-saydam panel uzerinden
-    iki float input al. Tab=sonraki alan, Enter=onayla, ESC=iptal, Backspace=sil.
+    Frame uzerinde tiklanmis 4 noktayi gosterirken, yari-saydam panel
+    uzerinden serit genisligi ve periyot degerlerini al.
+
+    Tab=sonraki alan, Enter=onayla, ESC=iptal, Backspace=sil.
     """
-    win = "Yol parametreleri  |  Tab=sonraki, Enter=onayla, ESC=iptal"
+    win = "Yol parametreleri  |  Tab=sonraki  Enter=onayla  ESC=iptal"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, 1280, 800)
 
     fields = [
-        {"label": "Serit genisligi (P1-P2 arasi, m)",  "value": str(defaults[0])},
-        {"label": "Periyot (P1-P4 arasi, m)",          "value": str(defaults[1])},
+        {"label": "Serit genisligi (P1-P2, m)",  "value": str(defaults[0])},
+        {"label": "Periyot (P1-P4, m)",           "value": str(defaults[1])},
     ]
     active = 0
+    error_msg = ""
 
     def is_valid_char(ch: int) -> bool:
         return (48 <= ch <= 57) or ch in (ord("."), ord(","))
@@ -176,23 +396,23 @@ def prompt_params_gui(frame: np.ndarray,
     while True:
         canvas = frame.copy()
 
-        # 4 noktayi ve baglantilari ciz
+        # 4 noktayi ciz
         for i, (x, y) in enumerate(points):
-            cv2.circle(canvas, (x, y), 8, (0, 255, 0), -1)
+            color = POINT_COLORS[i]
+            cv2.circle(canvas, (x, y), 8, color, -1)
             cv2.putText(canvas, f"P{i+1}", (x + 12, y - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        # P1-P2 (kirmizi: width)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+        # P1-P2, P3-P4 (kirmizi: genislik)
         cv2.line(canvas, points[0], points[1], (0, 0, 255), 3)
-        # P3-P4 (kirmizi: width)
         cv2.line(canvas, points[2], points[3], (0, 0, 255), 3)
-        # P1-P4 (mavi: period)
+        # P1-P4, P2-P3 (mavi: periyot)
         cv2.line(canvas, points[0], points[3], (255, 100, 0), 3)
-        # P2-P3 (mavi: period)
         cv2.line(canvas, points[1], points[2], (255, 100, 0), 3)
 
         # Yari-saydam panel
         h, w = canvas.shape[:2]
-        panel_w, panel_h = 760, 360
+        panel_w, panel_h = 760, 380
         x0 = (w - panel_w) // 2
         y0 = (h - panel_h) // 2
         overlay = canvas.copy()
@@ -207,40 +427,46 @@ def prompt_params_gui(frame: np.ndarray,
                     (x0 + 24, y0 + 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
-        # Renk legend'i
+        # Renk legendi
         cv2.line(canvas, (x0 + 24, y0 + 78), (x0 + 60, y0 + 78), (0, 0, 255), 3)
-        cv2.putText(canvas, "Kirmizi = serit genisligi",
+        cv2.putText(canvas, "Kirmizi = serit genisligi (P1-P2)",
                     (x0 + 70, y0 + 84),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-        cv2.line(canvas, (x0 + 360, y0 + 78), (x0 + 396, y0 + 78), (255, 100, 0), 3)
-        cv2.putText(canvas, "Mavi = periyot",
-                    (x0 + 406, y0 + 84),
+        cv2.line(canvas, (x0 + 24, y0 + 104), (x0 + 60, y0 + 104), (255, 100, 0), 3)
+        cv2.putText(canvas, "Mavi = periyot (P1-P4)",
+                    (x0 + 70, y0 + 110),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
+        # Referans degerleri
         cv2.putText(canvas, "Otoyol: 3.75 / 18.0    Devlet yolu: 3.50 / 9.0",
-                    (x0 + 24, y0 + 114),
+                    (x0 + 24, y0 + 140),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
 
-        # Alanlar
+        # Input alanlari
         for i, f in enumerate(fields):
-            ty = y0 + 170 + i * 80
+            ty = y0 + 190 + i * 80
             color = (0, 255, 100) if i == active else (180, 180, 180)
             cv2.putText(canvas, f["label"], (x0 + 24, ty),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 1)
 
-            box_x = x0 + 460
+            box_x = x0 + 420
             box_y = ty - 28
-            cv2.rectangle(canvas, (box_x, box_y), (box_x + 260, box_y + 40),
+            cv2.rectangle(canvas, (box_x, box_y), (box_x + 300, box_y + 40),
                           color, 2)
             text = f["value"]
             if i == active:
                 text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-                cv2.line(canvas,
-                         (box_x + 12 + text_size[0] + 4, box_y + 8),
-                         (box_x + 12 + text_size[0] + 4, box_y + 32),
+                cursor_x = box_x + 12 + text_size[0] + 4
+                cv2.line(canvas, (cursor_x, box_y + 8), (cursor_x, box_y + 32),
                          color, 2)
             cv2.putText(canvas, text, (box_x + 12, box_y + 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # Hata mesaji
+        if error_msg:
+            cv2.putText(canvas, error_msg,
+                        (x0 + 24, y0 + panel_h - 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         cv2.putText(canvas, "Tab: sonraki alan   Enter: onayla   ESC: iptal",
                     (x0 + 24, y0 + panel_h - 24),
@@ -248,7 +474,6 @@ def prompt_params_gui(frame: np.ndarray,
 
         cv2.imshow(win, canvas)
 
-        # waitKeyEx: platforma gore degisen keycode'lari daha guvenilir yakalar
         k = cv2.waitKeyEx(20)
         if k < 0:
             continue
@@ -256,31 +481,45 @@ def prompt_params_gui(frame: np.ndarray,
 
         if key == 255 or key == 0:
             continue
+
         if key == 27:  # ESC
             cv2.destroyWindow(win)
             cv2.waitKey(1)
             return None
+
         if key == 9:  # Tab
             active = (active + 1) % len(fields)
+            error_msg = ""
             continue
 
         # Enter
         if key in (13, 10):
+            error_msg = ""
             try:
                 w_val = float(fields[0]["value"].replace(",", "."))
                 p_val = float(fields[1]["value"].replace(",", "."))
             except ValueError:
+                error_msg = "Gecersiz sayi formati"
                 continue
 
-            if 0.1 <= w_val <= 100 and 0.1 <= p_val <= 100:
-                cv2.destroyWindow(win)
-                cv2.waitKey(1)  # GUI event flush
-                return (w_val, p_val)
-            continue
+            if w_val <= 0 or p_val <= 0:
+                error_msg = "Degerler pozitif olmali"
+                continue
+            if not (0.5 <= w_val <= 20.0):
+                error_msg = f"Serit genisligi mantikli degil: {w_val}m (beklenen 0.5-20m)"
+                continue
+            if not (1.0 <= p_val <= 100.0):
+                error_msg = f"Periyot mantikli degil: {p_val}m (beklenen 1-100m)"
+                continue
 
-        # Backspace (sisteme gore 8 veya 127 gelebilir)
+            cv2.destroyWindow(win)
+            cv2.waitKey(1)
+            return (w_val, p_val)
+
+        # Backspace
         if key in (8, 127):
             fields[active]["value"] = fields[active]["value"][:-1]
+            error_msg = ""
             continue
 
         if is_valid_char(key):
@@ -290,10 +529,19 @@ def prompt_params_gui(frame: np.ndarray,
             if ch == "." and "." in fields[active]["value"]:
                 continue
             fields[active]["value"] += ch
+            error_msg = ""
             continue
 
 
+# ─── Homografi hesaplama ────────────────────────────────────────────────────
+
 def build_world_points(lane_width_m: float, lane_period_m: float) -> np.ndarray:
+    """
+    4 noktanin dunya koordinatlarini olustur.
+    Orijin = P1 (yakin sol kose).
+    X ekseni = seridin enine yonu (sag tarafa dogru).
+    Y ekseni = seridin boyuna yonu (uzaga dogru).
+    """
     return np.array([
         [0.0,          0.0],            # P1: yakin sol
         [lane_width_m, 0.0],            # P2: yakin sag
@@ -302,28 +550,86 @@ def build_world_points(lane_width_m: float, lane_period_m: float) -> np.ndarray:
     ], dtype=np.float32)
 
 
-# ─── Main ───
+def compute_homography(
+    pixel_points: list[tuple[int, int]],
+    world_points: np.ndarray,
+) -> tuple[np.ndarray | None, float, list[float]]:
+    """
+    Homografi hesapla ve dogrula.
+
+    getPerspectiveTransform kullanir (findHomography degil):
+    tam 4 nokta var, RANSAC'a gerek yok, RANSAC bazen bir noktayi
+    outlier sayip dejenere matris uretebilir.
+
+    Dondurulen: (H_matrisi, kondisyon_sayisi, nokta_basi_hatalar_metre)
+    """
+    pts_img = np.array(pixel_points, dtype=np.float32)
+    pts_world = world_points.copy()
+
+    H = cv2.getPerspectiveTransform(pts_img, pts_world)
+
+    # Kondisyon sayisi kontrolu
+    cond = np.linalg.cond(H)
+
+    # Reprojection hatalari
+    errors = []
+    for i, (u, v) in enumerate(pixel_points):
+        p = np.array([float(u), float(v), 1.0], dtype=np.float64)
+        w = H @ p
+        if abs(w[2]) < 1e-12:
+            errors.append(float("inf"))
+            continue
+        X = w[0] / w[2]
+        Y = w[1] / w[2]
+        expected = world_points[i]
+        err = float(np.hypot(X - expected[0], Y - expected[1]))
+        errors.append(err)
+
+    return H, cond, errors
+
+
+# ─── Main ───────────────────────────────────────────────────────────────────
+
 def main():
-    print("[bilgi] Kameradan frame yakalaniyor...")
-    try:
-        frame = grab_frame_from_camera()
-    except Exception as e:
-        print(f"[hata] Frame yakalanamadi: {e}")
-        sys.exit(1)
-    print(f"[bilgi] Frame alindi: {frame.shape[1]}x{frame.shape[0]}")
+    args = parse_args()
+
+    # Frame al
+    if args.image:
+        print(f"[bilgi] Goruntu dosyasindan yukleniyor: {args.image}")
+        try:
+            frame = load_frame_from_file(args.image)
+        except Exception as e:
+            print(f"[hata] {e}")
+            sys.exit(1)
+    else:
+        print(f"[bilgi] Kameradan frame yakalaniyor ({args.device})...")
+        try:
+            frame = grab_frame_from_camera(args.device)
+        except Exception as e:
+            print(f"[hata] Frame yakalanamadi: {e}")
+            sys.exit(1)
+
+    print(f"[bilgi] Frame boyutu: {frame.shape[1]}x{frame.shape[0]}")
 
     # 1) 4 nokta tikla
-    print("[bilgi] 4 noktayi sirayla tikla. R=sifirla, ESC=iptal.")
+    print()
+    print("─── Nokta secimi ───")
+    print("Tek seridin (tercihen orta serit) iki ardisik kesik cizgi baslangicini tikla.")
+    print("Sira: P1(yakin sol) → P2(yakin sag) → P3(uzak sag) → P4(uzak sol)")
+    print("R=sifirla, Z=geri al, ESC=iptal")
+    print()
+
     points = collect_4_points(frame)
     if points is None:
         print("[bilgi] Iptal edildi.")
         sys.exit(0)
-    print(f"[bilgi] 4 nokta alindi:")
-    for i, p in enumerate(points, 1):
-        print(f"        P{i}: {p}")
+
+    print(f"\n[bilgi] 4 nokta alindi:")
+    for i, p in enumerate(points):
+        print(f"  P{i+1}: piksel({p[0]}, {p[1]})  — {POINT_LABELS[i]}")
 
     # 2) GUI'den parametreleri al
-    params = prompt_params_gui(frame, points)
+    params = prompt_params_gui(frame, points, defaults=(args.width, args.period))
     if params is None:
         print("[bilgi] Iptal edildi.")
         sys.exit(0)
@@ -331,43 +637,78 @@ def main():
     lane_width, lane_period = params
     world_points = build_world_points(lane_width, lane_period)
 
-    print(f"[bilgi] Serit genisligi: {lane_width} m")
-    print(f"[bilgi] Periyot: {lane_period} m")
-    print(f"[bilgi] Dunya koordinatlari:")
-    for i, wp in enumerate(world_points, 1):
-        print(f"        P{i}: {wp.tolist()}")
+    print(f"\n[bilgi] Serit genisligi: {lane_width} m")
+    print(f"[bilgi] Periyot:         {lane_period} m")
 
     # 3) Homografi hesapla
-    pts_img = np.array(points, dtype=np.float32)
-    H, _ = cv2.findHomography(pts_img, world_points)
+    H, cond, errors = compute_homography(points, world_points)
     if H is None:
         print("[hata] Homografi hesaplanamadi.")
         sys.exit(1)
 
+    # Kondisyon uyarisi
+    if cond > CONDITION_NUMBER_WARN:
+        print(f"\n[!] UYARI: Kondisyon sayisi cok yuksek ({cond:.0e}).")
+        print("    Matris sayisal olarak guvenilmez. Noktalari tekrar sec.")
+        print("    Noktalar birbirine cok yakin veya neredeyse ayni cizgi uzerinde olabilir.\n")
+
+    max_err = max(errors)
+    if max_err > REPROJECTION_WARN_THRESHOLD_M:
+        print(f"\n[!] UYARI: Reprojection hatasi yuksek (max {max_err:.4f} m).")
+        print("    getPerspectiveTransform ile bu normalde ~0 olmali.")
+        print("    Noktalar veya parametreler tutarsiz olabilir.\n")
+
     # 4) Kaydet
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     np.save(OUTPUT_PATH, H)
 
-    backup_jpg = os.path.join(REPO_ROOT, "configs", "calibration_frame.jpg")
-    cv2.imwrite(backup_jpg, frame)
+    backup_jpg = os.path.join(OUTPUT_DIR, "calibration_frame.jpg")
+    annotated = frame.copy()
+    for i, (x, y) in enumerate(points):
+        color = POINT_COLORS[i]
+        cv2.circle(annotated, (x, y), 8, color, -1)
+        cv2.putText(annotated, f"P{i+1}", (x + 12, y - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    cv2.line(annotated, points[0], points[1], (0, 0, 255), 2)
+    cv2.line(annotated, points[2], points[3], (0, 0, 255), 2)
+    cv2.line(annotated, points[0], points[3], (255, 100, 0), 2)
+    cv2.line(annotated, points[1], points[2], (255, 100, 0), 2)
+    cv2.imwrite(backup_jpg, annotated)
 
+    # Kalibrasyon parametrelerini de kaydet (tekrar uretim icin)
+    calib_data = {
+        "pixel_points": points,
+        "lane_width_m": lane_width,
+        "lane_period_m": lane_period,
+        "world_points": world_points.tolist(),
+        "condition_number": float(cond),
+        "reprojection_errors_m": errors,
+    }
+    calib_path = os.path.join(OUTPUT_DIR, "calibration_params.npy")
+    np.save(calib_path, calib_data)
+
+    # 5) Sonuc raporu
     print("\n─── Sonuc ───")
     print(f"Homografi matrisi:\n{H}")
-    print(f"\nKaydedildi: {OUTPUT_PATH}")
-    print(f"Yedek frame: {backup_jpg}")
+    print(f"\nKondisyon sayisi: {cond:.2e}")
+    print(f"Kaydedildi:       {OUTPUT_PATH}")
+    print(f"Parametreler:     {calib_path}")
+    print(f"Yedek frame:      {backup_jpg}")
 
-    # 5) Dogrulama
-    print("\n─── Dogrulama ───")
+    print("\n─── Reprojection dogrulama ───")
     for i, (u, v) in enumerate(points):
-        p = np.array([u, v, 1.0])
+        p = np.array([float(u), float(v), 1.0], dtype=np.float64)
         w = H @ p
         X, Y = w[0] / w[2], w[1] / w[2]
         expected = world_points[i]
-        err = float(np.linalg.norm([X - expected[0], Y - expected[1]]))
-        print(f"P{i+1}: piksel({u},{v}) -> dunya({X:6.2f}, {Y:6.2f})  "
-              f"beklenen({expected[0]:.2f}, {expected[1]:.2f})  hata={err:.3f} m")
+        status = "OK" if errors[i] < REPROJECTION_WARN_THRESHOLD_M else "YUKSEK"
+        print(
+            f"  P{i+1}: piksel({u},{v}) → dunya({X:6.3f}, {Y:6.3f})  "
+            f"beklenen({expected[0]:.2f}, {expected[1]:.2f})  "
+            f"hata={errors[i]:.4f}m [{status}]"
+        )
 
-    print("\n[bilgi] Artik 'python3 main.py' ile pipeline'i baslatabilirsin.")
+    print(f"\n[bilgi] Artik 'python3 highway_detection.py' ile pipeline'i baslatabilirsin.")
 
 
 if __name__ == "__main__":
