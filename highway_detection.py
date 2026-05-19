@@ -550,11 +550,11 @@ def build_pipeline(args):
         videoconvert !
         video/x-raw,format=I420 !
         x264enc bitrate={ENCODER_BITRATE_KBPS} tune=zerolatency speed-preset=ultrafast
-                threads=2 key-int-max=60 b-adapt=false bframes=0
+                threads=4 key-int-max=60 b-adapt=false bframes=0
                 option-string="no-mbtree:sliced-threads:rc-lookahead=0" !
         h264parse !
         rtph264pay config-interval=1 pt=96 !
-        udpsink host=127.0.0.1 port={RTSP_UDP_PORT} sync=false async=false buffer-size=2097152
+        udpsink host=127.0.0.1 port={RTSP_UDP_PORT} sync=false async=false buffer-size=4194304
     """ if not args.no_rtsp else ""
 
     pipeline_str = common + display_branch + rtsp_branch
