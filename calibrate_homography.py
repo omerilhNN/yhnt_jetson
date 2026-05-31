@@ -28,6 +28,8 @@ Kullanim:
     python3 calibrate_homography.py
     python3 calibrate_homography.py --device /dev/video0
     python3 calibrate_homography.py --image frame.jpg
+    python3 calibrate_homography.py --video demo1.mp4
+    python3 calibrate_homography.py --video demo1.mp4 --video-time 5.0
 """
 
 import argparse
@@ -79,6 +81,20 @@ def parse_args():
     parser.add_argument(
         "--image", default=None,
         help="Kamera yerine mevcut bir goruntu dosyasi kullan (.jpg/.png)",
+    )
+    parser.add_argument(
+        "--video", default=None,
+        help="Video dosyasindan frame al (MP4/MKV/AVI). "
+             "--video-time ile hangi saniyeden alinacagi belirtilebilir.",
+    )
+    parser.add_argument(
+        "--video-time", type=float, default=2.0,
+        help="--video ile kullanilir: frame'in alinacagi saniye (varsayilan: 2.0s)",
+    )
+    parser.add_argument(
+        "--video-browse", action="store_true",
+        help="--video ile kullanilir: video uzerinde interaktif gezinerek "
+             "frame sec (ok tuslari / trackbar ile)",
     )
     parser.add_argument(
         "--width", type=float, default=DEFAULT_LANE_WIDTH_M,
@@ -154,6 +170,176 @@ def load_frame_from_file(path: str) -> np.ndarray:
     if frame is None:
         raise RuntimeError(f"Goruntu okunamadi: {path}")
     return frame
+
+
+def grab_frame_from_video(path: str, time_sec: float) -> np.ndarray:
+    """
+    Video dosyasindan belirli bir saniyedeki frame'i al.
+    OpenCV VideoCapture kullanir (codec bagimsiz).
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Video dosyasi bulunamadi: {path}")
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Video acilamadi: {path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_sec = total_frames / fps if fps > 0 else 0
+
+    if time_sec < 0:
+        time_sec = 0
+    if duration_sec > 0 and time_sec > duration_sec:
+        print(f"[uyari] İstenen zaman ({time_sec:.1f}s) video süresinden ({duration_sec:.1f}s) büyük, "
+              f"son saniyeye ayarlanıyor.")
+        time_sec = max(0, duration_sec - 0.1)
+
+    target_ms = time_sec * 1000.0
+    cap.set(cv2.CAP_PROP_POS_MSEC, target_ms)
+
+    ret, frame = cap.read()
+    actual_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+    cap.release()
+
+    if not ret or frame is None:
+        raise RuntimeError(f"Video'dan frame okunamadı (t={time_sec:.1f}s)")
+
+    print(f"[bilgi] Video: {path}")
+    print(f"[bilgi]   FPS={fps:.1f}, toplam={total_frames} frame, süre={duration_sec:.1f}s")
+    print(f"[bilgi]   Frame alındı: t={actual_ms/1000:.2f}s")
+
+    return frame
+
+
+def browse_video_frames(path: str) -> np.ndarray | None:
+    """
+    Video dosyasini interaktif olarak gezinerek frame sec.
+
+    Kontroller:
+      ← / → : 1 frame geri/ileri
+      A / D  : 1 saniye geri/ileri
+      Q / E  : 10 saniye geri/ileri
+      Space/Enter : Bu frame'i sec
+      ESC    : İptal
+      Trackbar ile de gezinilebilir.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Video dosyasi bulunamadi: {path}")
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Video acilamadi: {path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_sec = total_frames / fps if fps > 0 else 0
+
+    if total_frames <= 0:
+        cap.release()
+        raise RuntimeError("Video frame sayısı alınamadı")
+
+    print(f"[bilgi] Video: {path}")
+    print(f"[bilgi]   FPS={fps:.1f}, toplam={total_frames} frame, süre={duration_sec:.1f}s")
+    print()
+    print("─── Video gezgini ───")
+    print("  ← / →     : 1 frame geri/ileri")
+    print("  A / D      : 1 saniye geri/ileri")
+    print("  Q / E      : 10 saniye geri/ileri")
+    print("  Space/Enter: Bu frame'i seç")
+    print("  ESC        : İptal")
+    print()
+
+    win_name = "Video gezgini  |  ←→=frame  AD=1s  QE=10s  Space=sec  ESC=iptal"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, 1280, 800)
+
+    current_frame_idx = 0
+    selected_frame = None
+
+    # Trackbar callback
+    def on_trackbar(val):
+        nonlocal current_frame_idx
+        current_frame_idx = val
+
+    cv2.createTrackbar("Frame", win_name, 0, max(total_frames - 1, 1), on_trackbar)
+
+    def read_frame_at(idx):
+        idx = max(0, min(idx, total_frames - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return None
+        return frame
+
+    last_displayed_idx = -1
+
+    while True:
+        # Frame'i oku ve göster
+        if current_frame_idx != last_displayed_idx:
+            frame = read_frame_at(current_frame_idx)
+            if frame is None:
+                current_frame_idx = max(0, current_frame_idx - 1)
+                continue
+            last_displayed_idx = current_frame_idx
+
+            # Bilgi overlay
+            display = frame.copy()
+            t_sec = current_frame_idx / fps if fps > 0 else 0
+            info = f"Frame {current_frame_idx}/{total_frames-1}  |  t={t_sec:.2f}s / {duration_sec:.1f}s"
+            cv2.putText(display, info, (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            cv2.putText(display, "Space/Enter = sec   ESC = iptal", (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+            cv2.imshow(win_name, display)
+
+            # Trackbar'ı güncelle
+            cv2.setTrackbarPos("Frame", win_name, current_frame_idx)
+
+        key = cv2.waitKeyEx(30)
+        if key < 0:
+            continue
+
+        k = key & 0xFF
+
+        # ESC
+        if k == 27:
+            selected_frame = None
+            break
+
+        # Space veya Enter
+        if k in (32, 13, 10):
+            selected_frame = read_frame_at(current_frame_idx)
+            t_sec = current_frame_idx / fps if fps > 0 else 0
+            print(f"[bilgi] Frame seçildi: #{current_frame_idx}, t={t_sec:.2f}s")
+            break
+
+        # Ok tuşları (← = 81/65361, → = 83/65363)
+        if key == 65361 or k == 81:  # ← sol ok
+            current_frame_idx = max(0, current_frame_idx - 1)
+        elif key == 65363 or k == 83:  # → sağ ok
+            current_frame_idx = min(total_frames - 1, current_frame_idx + 1)
+
+        # A/D = 1 saniye
+        elif k in (ord("a"), ord("A")):
+            jump = int(fps) if fps > 0 else 30
+            current_frame_idx = max(0, current_frame_idx - jump)
+        elif k in (ord("d"), ord("D")):
+            jump = int(fps) if fps > 0 else 30
+            current_frame_idx = min(total_frames - 1, current_frame_idx + jump)
+
+        # Q/E = 10 saniye
+        elif k in (ord("q"), ord("Q")):
+            jump = int(fps * 10) if fps > 0 else 300
+            current_frame_idx = max(0, current_frame_idx - jump)
+        elif k in (ord("e"), ord("E")):
+            jump = int(fps * 10) if fps > 0 else 300
+            current_frame_idx = min(total_frames - 1, current_frame_idx + jump)
+
+    cap.release()
+    cv2.destroyWindow(win_name)
+    cv2.waitKey(1)
+    return selected_frame
 
 
 # ─── Geometri dogrulama ─────────────────────────────────────────────────────
@@ -593,8 +779,27 @@ def compute_homography(
 def main():
     args = parse_args()
 
+    # Kaynak doğrulama: sadece biri seçilmeli
+    sources = [args.image, args.video]
+    if sum(s is not None for s in sources) > 1:
+        print("[hata] --image ve --video aynı anda kullanılamaz. Birini seçin.")
+        sys.exit(1)
+
     # Frame al
-    if args.image:
+    if args.video:
+        print(f"[bilgi] Video dosyasından frame alınıyor: {args.video}")
+        try:
+            if args.video_browse:
+                frame = browse_video_frames(args.video)
+                if frame is None:
+                    print("[bilgi] İptal edildi.")
+                    sys.exit(0)
+            else:
+                frame = grab_frame_from_video(args.video, args.video_time)
+        except Exception as e:
+            print(f"[hata] {e}")
+            sys.exit(1)
+    elif args.image:
         print(f"[bilgi] Goruntu dosyasindan yukleniyor: {args.image}")
         try:
             frame = load_frame_from_file(args.image)

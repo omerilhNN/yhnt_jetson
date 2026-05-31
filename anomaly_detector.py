@@ -120,9 +120,15 @@ class AnomalyConfig:
     accident_duration_sec: float = 3.0
 
     # Sudden brake (ani yavaşlama)
-    # N saniye içinde hız düşüşü eşiği (km/h)
-    sudden_brake_decel_kmh: float = 40.0   # 40 km/h düşüş → ani fren
-    sudden_brake_window_sec: float = 2.0   # bu pencere içinde ölçülür
+    # Homography tabanlı hız hesabında frame-to-frame 10-20 km/h dalgalanma normal.
+    # False positive'leri önlemek için:
+    #   - Eşik yüksek tutulur (60 km/h düşüş = gerçek ani fren)
+    #   - Penceredeki max yerine P75 hız kullanılır (spike filtresi)
+    #   - Minimum önceki hız kontrolü: yavaş araçlarda küçük düşüş bile oransal
+    #     olarak büyük görünür, bu yüzden sadece makul hızda giden araçlar kontrol edilir
+    sudden_brake_decel_kmh: float = 60.0     # 60 km/h düşüş → ani fren
+    sudden_brake_window_sec: float = 2.5     # bu pencere içinde ölçülür
+    sudden_brake_min_prior_kmh: float = 70.0 # penceredeki P75 hız bunun altındaysa atla
 
     # Overspeed (hız limiti aşımı)
     overspeed_threshold_kmh: float = 140.0
@@ -608,13 +614,21 @@ class AnomalyDetector:
         out: list[AnomalyEvent],
     ):
         """
-        Ani yavaşlama tespiti.
-        Pencere içindeki en yüksek hız ile şu anki hız arasındaki fark eşiği aşarsa tetikler.
+        Ani yavaşlama tespiti — homography jitter'a toleranslı versiyon.
+
+        Eski mantık: penceredeki MAX hız - anlık hız.
+        Sorun: tek bir spike (sahte yüksek okuma) tüm pencereyi kirletir.
+
+        Yeni mantık:
+        1. Penceredeki hız örneklerinin P75'ini (75. persentil) hesapla.
+           Bu, arada bir gelen spike'ları filtreler ama gerçek yüksek hızı yansıtır.
+        2. P75 < sudden_brake_min_prior_kmh ise atla (zaten yavaş giden araç).
+        3. P75 - anlık hız ≥ sudden_brake_decel_kmh ise → ani fren.
         """
         cfg = self.cfg
 
         for tid, history in self._history.items():
-            if len(history) < 3:
+            if len(history) < 5:  # P75 hesabı için minimum 5 sample
                 continue
             if not self._is_track_mature(tid, timestamp):
                 continue
@@ -623,20 +637,28 @@ class AnomalyDetector:
             if info is None:
                 continue
 
-            # Pencere içindeki en yüksek hızı bul
+            # Pencere içindeki hız örneklerini topla
             window_start = timestamp - cfg.sudden_brake_window_sec
-            max_speed_in_window = 0.0
+            window_speeds: list[float] = []
             for sample in history:
                 if sample.timestamp >= window_start:
-                    if sample.speed_kmh > max_speed_in_window:
-                        max_speed_in_window = sample.speed_kmh
+                    window_speeds.append(sample.speed_kmh)
 
-            # Duran araçlar zaten STOPPED_VEHICLE tarafından yakalanır
-            # Burada sadece hareket halindeyken ani fren yapanları yakalıyoruz
-            if max_speed_in_window < cfg.underspeed_threshold_kmh:
+            if len(window_speeds) < 4:
                 continue
 
-            decel = max_speed_in_window - info.speed_kmh
+            # P75 hesapla (sorted'ın %75 noktası)
+            window_speeds_sorted = sorted(window_speeds)
+            p75_idx = int(len(window_speeds_sorted) * 0.75)
+            p75_speed = window_speeds_sorted[min(p75_idx, len(window_speeds_sorted) - 1)]
+
+            # Önceki hız yeterince yüksek mi?
+            # Yavaş giden araçlarda (ör. 50 → 10 km/h) fark 40 çıksa bile
+            # bu normal trafik davranışı olabilir. Sadece makul hızdaki araçlar.
+            if p75_speed < cfg.sudden_brake_min_prior_kmh:
+                continue
+
+            decel = p75_speed - info.speed_kmh
             if decel < cfg.sudden_brake_decel_kmh:
                 continue
 
@@ -661,7 +683,7 @@ class AnomalyDetector:
                 decel_kmh=decel,
                 message=(
                     f"Araç (track_id={tid}, {info.class_name}) ani yavaşlama: "
-                    f"{max_speed_in_window:.0f} → {info.speed_kmh:.0f} km/h "
+                    f"{p75_speed:.0f} → {info.speed_kmh:.0f} km/h "
                     f"({decel:.0f} km/h düşüş, {cfg.sudden_brake_window_sec}s içinde)."
                 ),
             ))
